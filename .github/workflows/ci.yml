@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      PORT: 3000
+      DATABASE_URL: postgresql://meutreino:meutreino@localhost:5432/meutreino
+      CORS_ORIGINS: http://localhost:8081
+      LOG_LEVEL: error
+      EXPO_PUBLIC_API_URL: http://localhost:3000
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: meutreino
+          POSTGRES_PASSWORD: meutreino
+          POSTGRES_DB: meutreino
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U meutreino -d meutreino"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run db:migrate
+      - run: npm run test:e2e
+      - run: npm run build

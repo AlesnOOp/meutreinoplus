@@ -1,0 +1,1225 @@
+// MeuTreino+ initial schema.
+// Client-generated identifiers omit @default(uuid()) on executed-workout rows.
+// Extra checks, partial indexes, and immutability triggers live in the initial migration.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["meutreino"]
+}
+
+enum UserStatus {
+  active
+  pending_deletion
+  deleted
+  @@schema("meutreino")
+}
+
+enum AuthProvider {
+  email
+  apple
+  google
+  @@schema("meutreino")
+}
+
+enum UnitSystem {
+  metric
+  imperial
+  @@schema("meutreino")
+}
+
+enum WeightUnit {
+  kg
+  lb
+  @@schema("meutreino")
+}
+
+enum DistanceUnit {
+  km
+  mi
+  @@schema("meutreino")
+}
+
+enum ThemePreference {
+  system
+  light
+  dark
+  @@schema("meutreino")
+}
+
+enum SecurityAuditOutcome {
+  success
+  failure
+  @@schema("meutreino")
+}
+
+enum WeekStart {
+  monday
+  sunday
+  @@schema("meutreino")
+}
+
+enum ConsentPurpose {
+  terms_of_use
+  privacy_policy
+  health_data_processing
+  professional_sharing
+  @@schema("meutreino")
+}
+
+enum AccountDeletionStatus {
+  scheduled
+  processing
+  completed
+  cancelled
+  @@schema("meutreino")
+}
+
+enum DataExportStatus {
+  pending
+  processing
+  ready
+  failed
+  expired
+  @@schema("meutreino")
+}
+
+enum GymAccessRole {
+  owner
+  @@schema("meutreino")
+}
+
+enum ArchiveStatus {
+  active
+  archived
+  @@schema("meutreino")
+}
+
+enum MediaKind {
+  profile_photo
+  equipment_photo
+  user_exercise_reference
+  licensed_exercise_reference
+  @@schema("meutreino")
+}
+
+enum ExerciseOrigin {
+  system
+  user
+  @@schema("meutreino")
+}
+
+enum MuscleGroup {
+  chest
+  back
+  shoulders
+  biceps
+  triceps
+  forearms
+  core
+  glutes
+  quadriceps
+  hamstrings
+  calves
+  full_body
+  other
+  @@schema("meutreino")
+}
+
+enum MuscleRole {
+  primary
+  secondary
+  @@schema("meutreino")
+}
+
+enum ActivityType {
+  strength
+  cardio
+  mobility
+  flexibility
+  other
+  @@schema("meutreino")
+}
+
+enum EquipmentType {
+  barbell
+  dumbbell
+  kettlebell
+  machine
+  cable
+  bodyweight
+  band
+  bench
+  pullup_bar
+  treadmill
+  bike
+  elliptical
+  other
+  @@schema("meutreino")
+}
+
+enum LoadType {
+  fixed
+  progressive
+  bodyweight
+  time
+  @@schema("meutreino")
+}
+
+enum PlannedSetKind {
+  normal
+  warmup
+  preparatory
+  drop_set
+  @@schema("meutreino")
+}
+
+enum PlanAccent {
+  slate
+  blue
+  green
+  amber
+  red
+  violet
+  teal
+  pink
+  @@schema("meutreino")
+}
+
+enum PlanConflictStatus {
+  open
+  keep_server
+  keep_local
+  keep_both
+  @@schema("meutreino")
+}
+
+enum PlanStatus {
+  active
+  archived
+  @@schema("meutreino")
+}
+
+enum SlotType {
+  workout_plan
+  cardio
+  rest
+  @@schema("meutreino")
+}
+
+enum CardioActivity {
+  walk
+  run
+  bike
+  spinning
+  hiit
+  elliptical
+  @@schema("meutreino")
+}
+
+enum SessionStatus {
+  in_progress
+  paused
+  completed
+  aborted
+  @@schema("meutreino")
+}
+
+enum PerformedSetOutcome {
+  completed
+  skipped
+  @@schema("meutreino")
+}
+
+enum SessionTimeKind {
+  pause
+  resume
+  rest_start
+  rest_pause
+  rest_resume
+  rest_finish
+  @@schema("meutreino")
+}
+
+enum SessionConflictStatus {
+  open
+  keep_server
+  keep_local
+  keep_both
+  @@schema("meutreino")
+}
+
+enum ExerciseSessionStatus {
+  pending
+  in_progress
+  completed
+  skipped
+  @@schema("meutreino")
+}
+
+enum ProfessionalStatus {
+  draft
+  active
+  suspended
+  @@schema("meutreino")
+}
+
+enum LinkStatus {
+  invited
+  pending_consent
+  active
+  revoked
+  declined
+  expired
+  @@schema("meutreino")
+}
+
+enum ProfessionalPermission {
+  read_plans
+  write_plans
+  read_sessions
+  read_feedback
+  @@schema("meutreino")
+}
+
+enum SubscriptionProvider {
+  apple
+  google
+  @@schema("meutreino")
+}
+
+enum SubscriptionStatus {
+  trialing
+  active
+  grace_period
+  billing_retry
+  expired
+  revoked
+  @@schema("meutreino")
+}
+
+enum BillingEnvironment {
+  sandbox
+  production
+  @@schema("meutreino")
+}
+
+enum DevicePlatform {
+  ios
+  android
+  web
+  @@schema("meutreino")
+}
+
+enum SyncEntityType {
+  user_profile
+  gym
+  equipment
+  exercise
+  workout_plan
+  weekly_schedule
+  workout_session
+  performed_set
+  exercise_feedback
+  student_professional_link
+  @@schema("meutreino")
+}
+
+enum SyncOperationType {
+  upsert
+  delete
+  correct
+  @@schema("meutreino")
+}
+
+enum SyncOperationStatus {
+  pending
+  applied
+  rejected
+  conflict
+  @@schema("meutreino")
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String?    @unique @db.Citext
+  passwordHash String?    @map("password_hash")
+  status       UserStatus @default(active)
+  locale       String     @default("pt-BR") @db.VarChar(35)
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt         DateTime?  @map("deleted_at") @db.Timestamptz(3)
+  emailVerifiedAt   DateTime?  @map("email_verified_at") @db.Timestamptz(3)
+  passwordChangedAt DateTime?  @map("password_changed_at") @db.Timestamptz(3)
+
+  profile             UserProfile?
+  authIdentities      AuthIdentity[]
+  authSessions        AuthSession[]
+  consents            ConsentRecord[]
+  deletionRequests    AccountDeletionRequest[]
+  exportRequests      DataExportRequest[]
+  ownedGyms           Gym[]                       @relation("GymOwner")
+  gymMemberships      UserGym[]
+  mediaAssets         MediaAsset[]
+  equipment           Equipment[]
+  customExercises     Exercise[]                  @relation("ExerciseOwner")
+  ownedPlans          WorkoutPlan[]               @relation("PlanOwner")
+  authoredPlans       WorkoutPlan[]               @relation("PlanAuthor")
+  schedules           WeeklySchedule[]
+  workoutSessions     WorkoutSession[]
+  feedback            ExerciseFeedback[]
+  professionalProfile ProfessionalProfile?
+  studentLinks        StudentProfessionalLink[]   @relation("StudentLinks")
+  professionalLinks   StudentProfessionalLink[]   @relation("ProfessionalLinks")
+  invitedLinks        StudentProfessionalLink[]   @relation("LinkInviter")
+  subscriptions       Subscription[]
+  devices             Device[]
+  syncOperations      SyncOperation[]
+  planConflicts       WorkoutPlanConflict[]
+  sessionConflicts    WorkoutSessionConflict[]
+  auditLogs           AuditLog[]                  @relation("AuditActor")
+  setCorrections      PerformedSetCorrection[]
+  emailVerifications  EmailVerificationToken[]
+  passwordResets      PasswordResetToken[]
+  emailChanges        EmailChangeToken[]
+  securityAuditEvents SecurityAuditEvent[]
+
+  @@index([status])
+  @@map("users")
+  @@schema("meutreino")
+}
+
+model AuthIdentity {
+  id              String       @id @default(uuid()) @db.Uuid
+  userId          String       @map("user_id") @db.Uuid
+  provider        AuthProvider
+  providerSubject String       @map("provider_subject")
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+  @@map("auth_identities")
+  @@schema("meutreino")
+}
+
+/// Refresh tokens are stored only as a SHA-256 hash. Access tokens are not persisted.
+model AuthSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  deviceId         String?   @map("device_id") @db.Uuid
+  refreshTokenHash String    @unique @map("refresh_token_hash")
+  familyId         String    @map("family_id") @db.Uuid
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(3)
+  lastUsedAt       DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(3)
+  replacedById     String?   @map("replaced_by_id") @db.Uuid
+  deviceLabel      String?   @map("device_label") @db.VarChar(80)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  device Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@map("auth_sessions")
+  @@schema("meutreino")
+}
+
+model UserProfile {
+  id           String     @id @default(uuid()) @db.Uuid
+  userId       String     @unique @map("user_id") @db.Uuid
+  displayName        String          @map("display_name") @db.VarChar(80)
+  unitSystem         UnitSystem      @default(metric) @map("unit_system")
+  weightUnit         WeightUnit      @default(kg) @map("weight_unit")
+  distanceUnit       DistanceUnit    @default(km) @map("distance_unit")
+  theme              ThemePreference @default(system)
+  timeZone           String          @default("America/Sao_Paulo") @map("time_zone") @db.VarChar(64)
+  notifyProductEmail Boolean         @default(false) @map("notify_product_email")
+  weekStartsOn       WeekStart       @default(monday) @map("week_starts_on")
+  photoAssetId       String?         @unique @map("photo_asset_id") @db.Uuid
+  version            Int             @default(1)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user  User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  photo MediaAsset? @relation(fields: [photoAssetId], references: [id], onDelete: SetNull)
+
+  @@map("user_profiles")
+  @@schema("meutreino")
+}
+
+/// Append-only. A later choice is a new row, not an update.
+model ConsentRecord {
+  id              String         @id @default(uuid()) @db.Uuid
+  userId          String         @map("user_id") @db.Uuid
+  purpose         ConsentPurpose
+  documentVersion String         @map("document_version") @db.VarChar(40)
+  granted         Boolean
+  recordedAt      DateTime       @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, purpose, recordedAt])
+  @@map("consent_records")
+  @@schema("meutreino")
+}
+
+model AccountDeletionRequest {
+  id               String                 @id @default(uuid()) @db.Uuid
+  userId           String                 @map("user_id") @db.Uuid
+  status           AccountDeletionStatus  @default(scheduled)
+  requestedAt      DateTime               @default(now()) @map("requested_at") @db.Timestamptz(3)
+  scheduledPurgeAt DateTime               @map("scheduled_purge_at") @db.Timestamptz(3)
+  completedAt      DateTime?              @map("completed_at") @db.Timestamptz(3)
+  cancelledAt      DateTime?              @map("cancelled_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([status, scheduledPurgeAt])
+  @@map("account_deletion_requests")
+  @@schema("meutreino")
+}
+
+model DataExportRequest {
+  id          String           @id @default(uuid()) @db.Uuid
+  userId      String           @map("user_id") @db.Uuid
+  status      DataExportStatus @default(pending)
+  requestedAt DateTime         @default(now()) @map("requested_at") @db.Timestamptz(3)
+  completedAt DateTime?        @map("completed_at") @db.Timestamptz(3)
+  expiresAt   DateTime?        @map("expires_at") @db.Timestamptz(3)
+  storageKey  String?          @map("storage_key")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, requestedAt])
+  @@map("data_export_requests")
+  @@schema("meutreino")
+}
+
+model Gym {
+  id          String        @id @default(uuid()) @db.Uuid
+  ownerUserId String        @map("owner_user_id") @db.Uuid
+  name        String        @db.VarChar(120)
+  nickname    String?       @db.VarChar(80)
+  branchName  String?       @map("branch_name") @db.VarChar(80)
+  city        String?       @db.VarChar(80)
+  notes       String?       @db.Text
+  status      ArchiveStatus @default(active)
+  isPreferred Boolean       @default(false) @map("is_preferred")
+  version     Int           @default(1)
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt   DateTime?     @map("deleted_at") @db.Timestamptz(3)
+
+  owner       User               @relation("GymOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  memberships UserGym[]
+  equipment      Equipment[]
+  sessions       WorkoutSession[]
+  planEquipment  WorkoutPlanExerciseEquipment[]
+
+  // Partial unique index gyms_one_preferred_per_owner is raw SQL and must stay.
+  @@index([ownerUserId, status])
+  @@map("gyms")
+  @@schema("meutreino")
+}
+
+model UserGym {
+  id        String        @id @default(uuid()) @db.Uuid
+  userId    String        @map("user_id") @db.Uuid
+  gymId     String        @map("gym_id") @db.Uuid
+  role      GymAccessRole @default(owner)
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  revokedAt DateTime?     @map("revoked_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  gym  Gym  @relation(fields: [gymId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, gymId])
+  @@index([gymId])
+  @@map("user_gyms")
+  @@schema("meutreino")
+}
+
+model MediaAsset {
+  id          String    @id @default(uuid()) @db.Uuid
+  ownerUserId String    @map("owner_user_id") @db.Uuid
+  kind        MediaKind
+  storageKey  String    @map("storage_key")
+  contentType String    @map("content_type") @db.VarChar(100)
+  byteSize    Int       @map("byte_size")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  owner     User         @relation(fields: [ownerUserId], references: [id], onDelete: Restrict)
+  profile   UserProfile?
+  equipment Equipment[]
+  exercises Exercise[]
+
+  @@index([ownerUserId, kind])
+  @@map("media_assets")
+  @@schema("meutreino")
+}
+
+model Equipment {
+  id            String        @id @default(uuid()) @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  gymId         String        @map("gym_id") @db.Uuid
+  name          String        @db.VarChar(120)
+  machineNumber String?       @map("machine_number") @db.VarChar(40)
+  nickname      String?       @db.VarChar(80)
+  photoAssetId  String?       @map("photo_asset_id") @db.Uuid
+  notes         String?       @db.Text
+  status        ArchiveStatus @default(active)
+  version       Int           @default(1)
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt     DateTime?     @map("deleted_at") @db.Timestamptz(3)
+
+  user          User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  gym           Gym                      @relation(fields: [gymId], references: [id], onDelete: Restrict)
+  photo         MediaAsset?              @relation(fields: [photoAssetId], references: [id], onDelete: SetNull)
+  exerciseLinks EquipmentExerciseLink[]
+  planUses      WorkoutPlanExerciseEquipment[]
+
+  @@index([userId, status])
+  @@index([gymId])
+  @@map("equipment")
+  @@schema("meutreino")
+}
+
+/// System rows have no owner. Custom exercises are rows with origin = user.
+model Exercise {
+  id              String         @id @default(uuid()) @db.Uuid
+  origin          ExerciseOrigin
+  ownerUserId     String?        @map("owner_user_id") @db.Uuid
+  namePt          String         @map("name_pt") @db.VarChar(160)
+  alternativeName String?        @map("alternative_name") @db.VarChar(160)
+  activityType    ActivityType   @map("activity_type")
+  description     String?        @db.Text
+  instructions    String?        @db.Text
+  status          ArchiveStatus  @default(active)
+  visualAssetId   String?        @map("visual_asset_id") @db.Uuid
+  version         Int            @default(1)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt       DateTime?      @map("deleted_at") @db.Timestamptz(3)
+
+  owner                   User?                            @relation("ExerciseOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  visualAsset             MediaAsset?                      @relation(fields: [visualAssetId], references: [id], onDelete: SetNull)
+  muscles                 ExerciseMuscle[]
+  equipmentRequirements   ExerciseEquipmentRequirement[]
+  equipmentLinks          EquipmentExerciseLink[]
+  planExercises           WorkoutPlanExercise[]
+  exerciseSessions        ExerciseSession[]
+
+  @@index([ownerUserId, deletedAt])
+  @@index([namePt])
+  @@map("exercises")
+  @@schema("meutreino")
+}
+
+model ExerciseMuscle {
+  exerciseId  String      @map("exercise_id") @db.Uuid
+  muscleGroup MuscleGroup @map("muscle_group")
+  role        MuscleRole
+
+  exercise Exercise @relation(fields: [exerciseId], references: [id], onDelete: Cascade)
+
+  @@id([exerciseId, muscleGroup])
+  @@map("exercise_muscles")
+  @@schema("meutreino")
+}
+
+model ExerciseEquipmentRequirement {
+  exerciseId    String        @map("exercise_id") @db.Uuid
+  equipmentType EquipmentType @map("equipment_type")
+
+  exercise Exercise @relation(fields: [exerciseId], references: [id], onDelete: Cascade)
+
+  @@id([exerciseId, equipmentType])
+  @@map("exercise_equipment_requirements")
+  @@schema("meutreino")
+}
+
+model EquipmentExerciseLink {
+  equipmentId String   @map("equipment_id") @db.Uuid
+  exerciseId  String   @map("exercise_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  equipment Equipment @relation(fields: [equipmentId], references: [id], onDelete: Cascade)
+  exercise  Exercise  @relation(fields: [exerciseId], references: [id], onDelete: Cascade)
+
+  @@id([equipmentId, exerciseId])
+  @@map("equipment_exercise_links")
+  @@schema("meutreino")
+}
+
+/// The student remains the owner. A professional may be the author without taking ownership.
+model WorkoutPlan {
+  id               String     @id @default(uuid()) @db.Uuid
+  ownerUserId      String     @map("owner_user_id") @db.Uuid
+  authoredByUserId String     @map("authored_by_user_id") @db.Uuid
+  name             String     @db.VarChar(120)
+  description      String?    @db.Text
+  accent           PlanAccent?
+  status           PlanStatus @default(active)
+  version          Int        @default(1)
+  duplicatedFromId String?    @map("duplicated_from_id") @db.Uuid
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt       DateTime?  @map("archived_at") @db.Timestamptz(3)
+
+  owner          User                   @relation("PlanOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  author         User                   @relation("PlanAuthor", fields: [authoredByUserId], references: [id], onDelete: Restrict)
+  duplicatedFrom WorkoutPlan?           @relation("PlanDuplication", fields: [duplicatedFromId], references: [id], onDelete: SetNull)
+  duplicates     WorkoutPlan[]          @relation("PlanDuplication")
+  exercises      WorkoutPlanExercise[]
+  revisions      WorkoutPlanRevision[]
+  conflicts      WorkoutPlanConflict[]
+  slots          WeeklyScheduleSlot[]
+  sessions       WorkoutSession[]
+
+  @@index([ownerUserId, status])
+  @@map("workout_plans")
+  @@schema("meutreino")
+}
+
+model WorkoutPlanExercise {
+  id          String  @id @default(uuid()) @db.Uuid
+  planId      String  @map("plan_id") @db.Uuid
+  exerciseId  String  @map("exercise_id") @db.Uuid
+  orderIndex  Int     @map("order_index")
+  restSeconds Int?    @map("rest_seconds")
+  notes       String? @db.Text
+  active      Boolean @default(true)
+
+  plan             WorkoutPlan                      @relation(fields: [planId], references: [id], onDelete: Cascade)
+  exercise         Exercise                         @relation(fields: [exerciseId], references: [id], onDelete: Restrict)
+  sets             WorkoutPlanSet[]
+  equipmentPrefs   WorkoutPlanExerciseEquipment[]
+  exerciseSessions ExerciseSession[]
+
+  // Partial unique index workout_plan_exercises_active_order_idx is raw SQL.
+  @@index([planId, active])
+  @@index([exerciseId])
+  @@map("workout_plan_exercises")
+  @@schema("meutreino")
+}
+
+/// Each set stores its own target. Progressive load is a label, not a calculated prescription.
+model WorkoutPlanSet {
+  id                    String   @id @default(uuid()) @db.Uuid
+  planExerciseId        String   @map("plan_exercise_id") @db.Uuid
+  setIndex              Int            @map("set_index")
+  setKind               PlannedSetKind @default(normal) @map("set_kind")
+  targetRepetitions     Int?           @map("target_repetitions")
+  targetRepetitionsMax  Int?           @map("target_repetitions_max")
+  loadType              LoadType       @map("load_type")
+  loadUnit              WeightUnit     @default(kg) @map("load_unit")
+  targetLoad            Decimal?       @map("target_load") @db.Decimal(7, 2)
+  targetLoadKg          Decimal?       @map("target_load_kg") @db.Decimal(7, 2)
+  targetDurationSeconds Int?     @map("target_duration_seconds")
+  restSeconds           Int?     @map("rest_seconds")
+  notes                 String?  @db.Text
+
+  planExercise WorkoutPlanExercise @relation(fields: [planExerciseId], references: [id], onDelete: Cascade)
+
+  @@unique([planExerciseId, setIndex])
+  @@map("workout_plan_sets")
+  @@schema("meutreino")
+}
+
+/// One plan exercise can point at a different machine in each gym.
+model WorkoutPlanExerciseEquipment {
+  planExerciseId String @map("plan_exercise_id") @db.Uuid
+  gymId          String @map("gym_id") @db.Uuid
+  equipmentId    String @map("equipment_id") @db.Uuid
+
+  planExercise WorkoutPlanExercise @relation(fields: [planExerciseId], references: [id], onDelete: Cascade)
+  gym          Gym                 @relation(fields: [gymId], references: [id], onDelete: Restrict)
+  equipment    Equipment           @relation(fields: [equipmentId], references: [id], onDelete: Restrict)
+
+  @@id([planExerciseId, gymId])
+  @@index([equipmentId])
+  @@map("workout_plan_exercise_equipment")
+  @@schema("meutreino")
+}
+
+/// Append-only photograph of a plan version. Later edits never change an old row.
+model WorkoutPlanRevision {
+  id        String   @id @default(uuid()) @db.Uuid
+  planId    String   @map("plan_id") @db.Uuid
+  version   Int
+  snapshot  Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  plan WorkoutPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@unique([planId, version])
+  @@map("workout_plan_revisions")
+  @@schema("meutreino")
+}
+
+model WorkoutPlanConflict {
+  id              String             @id @db.Uuid
+  userId          String             @map("user_id") @db.Uuid
+  planId          String             @map("plan_id") @db.Uuid
+  baseVersion     Int?               @map("base_version")
+  payload         Json
+  status          PlanConflictStatus @default(open)
+  preservedPlanId String?            @map("preserved_plan_id") @db.Uuid
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  resolvedAt      DateTime?          @map("resolved_at") @db.Timestamptz(3)
+
+  user User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  plan WorkoutPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@map("workout_plan_conflicts")
+  @@schema("meutreino")
+}
+
+model WeeklySchedule {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String   @db.VarChar(120)
+  timeZone  String   @map("time_zone") @db.VarChar(64)
+  isActive  Boolean  @default(false) @map("is_active")
+  version   Int      @default(1)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user  User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  slots WeeklyScheduleSlot[]
+
+  @@index([userId, isActive])
+  @@map("weekly_schedules")
+  @@schema("meutreino")
+}
+
+model WeeklyScheduleSlot {
+  id             String          @id @default(uuid()) @db.Uuid
+  scheduleId     String          @map("schedule_id") @db.Uuid
+  dayOfWeek      Int             @map("day_of_week")
+  position       Int
+  slotType       SlotType        @map("slot_type")
+  workoutPlanId  String?         @map("workout_plan_id") @db.Uuid
+  cardioActivity CardioActivity? @map("cardio_activity")
+  notes          String?         @db.Text
+
+  schedule    WeeklySchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  workoutPlan WorkoutPlan?   @relation(fields: [workoutPlanId], references: [id], onDelete: Restrict)
+
+  @@unique([scheduleId, dayOfWeek, position])
+  @@index([workoutPlanId])
+  @@map("weekly_schedule_slots")
+  @@schema("meutreino")
+}
+
+/// lockedAt freezes the recorded result. planSnapshot is the ficha photograph taken at start.
+model WorkoutSession {
+  id               String        @id @db.Uuid
+  userId           String        @map("user_id") @db.Uuid
+  workoutPlanId    String?       @map("workout_plan_id") @db.Uuid
+  planNameSnapshot String        @map("plan_name_snapshot") @db.VarChar(120)
+  planVersion      Int?          @map("plan_version")
+  planSnapshot     Json          @map("plan_snapshot")
+  gymId            String?       @map("gym_id") @db.Uuid
+  gymName          String?       @map("gym_name") @db.VarChar(120)
+  status           SessionStatus @default(in_progress)
+  startedAt        DateTime      @map("started_at") @db.Timestamptz(3)
+  pausedAt         DateTime?     @map("paused_at") @db.Timestamptz(3)
+  endedAt          DateTime?     @map("ended_at") @db.Timestamptz(3)
+  durationSeconds  Int?          @map("duration_seconds")
+  elapsedSeconds   Int?          @map("elapsed_seconds")
+  notes            String?       @db.Text
+  lockedAt         DateTime?     @map("locked_at") @db.Timestamptz(3)
+  version          Int           @default(1)
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user        User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  workoutPlan WorkoutPlan?             @relation(fields: [workoutPlanId], references: [id], onDelete: Restrict)
+  gym         Gym?                     @relation(fields: [gymId], references: [id], onDelete: Restrict)
+  exercises   ExerciseSession[]
+  timeEvents  SessionTimeEvent[]
+  conflicts   WorkoutSessionConflict[]
+
+  @@index([userId, startedAt])
+  @@index([workoutPlanId])
+  @@map("workout_sessions")
+  @@schema("meutreino")
+}
+
+model SessionTimeEvent {
+  id                  String          @id @db.Uuid
+  workoutSessionId    String          @map("workout_session_id") @db.Uuid
+  exerciseSessionId   String?         @map("exercise_session_id") @db.Uuid
+  kind                SessionTimeKind
+  occurredAt          DateTime        @map("occurred_at") @db.Timestamptz(3)
+  restDurationSeconds Int?            @map("rest_duration_seconds")
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  workoutSession  WorkoutSession   @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+  exerciseSession ExerciseSession? @relation(fields: [exerciseSessionId], references: [id], onDelete: Restrict)
+
+  @@index([workoutSessionId, occurredAt])
+  @@map("session_time_events")
+  @@schema("meutreino")
+}
+
+model WorkoutSessionConflict {
+  id               String                @id @db.Uuid
+  userId           String                @map("user_id") @db.Uuid
+  workoutSessionId String                @map("workout_session_id") @db.Uuid
+  baseVersion      Int?                  @map("base_version")
+  payload          Json
+  status           SessionConflictStatus @default(open)
+  createdAt        DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  resolvedAt       DateTime?             @map("resolved_at") @db.Timestamptz(3)
+
+  user           User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  workoutSession WorkoutSession @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@map("workout_session_conflicts")
+  @@schema("meutreino")
+}
+
+model ExerciseSession {
+  id                   String                @id @db.Uuid
+  workoutSessionId     String                @map("workout_session_id") @db.Uuid
+  planExerciseId       String?               @map("plan_exercise_id") @db.Uuid
+  exerciseId           String                @map("exercise_id") @db.Uuid
+  exerciseNameSnapshot String                @map("exercise_name_snapshot") @db.VarChar(160)
+  orderIndex           Int                   @map("order_index")
+  status               ExerciseSessionStatus @default(pending)
+  startedAt            DateTime?             @map("started_at") @db.Timestamptz(3)
+  endedAt              DateTime?             @map("ended_at") @db.Timestamptz(3)
+  skipReason           String?               @map("skip_reason") @db.VarChar(200)
+  plannedRestSeconds   Int?                  @map("planned_rest_seconds")
+  gymName              String?               @map("gym_name") @db.VarChar(120)
+  equipmentName        String?               @map("equipment_name") @db.VarChar(160)
+  machineNumber        String?               @map("machine_number") @db.VarChar(40)
+
+  workoutSession WorkoutSession       @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+  planExercise   WorkoutPlanExercise? @relation(fields: [planExerciseId], references: [id], onDelete: SetNull)
+  exercise       Exercise             @relation(fields: [exerciseId], references: [id], onDelete: Restrict)
+  sets           PerformedSet[]
+  feedback       ExerciseFeedback?
+  timeEvents     SessionTimeEvent[]
+
+  @@unique([workoutSessionId, orderIndex])
+  @@index([exerciseId])
+  @@map("exercise_sessions")
+  @@schema("meutreino")
+}
+
+/// Immutable. A mistake is recorded in performed_set_corrections.
+model PerformedSet {
+  id                       String              @id @db.Uuid
+  exerciseSessionId        String              @map("exercise_session_id") @db.Uuid
+  plannedSetId             String?             @map("planned_set_id") @db.Uuid
+  setIndex                 Int                 @map("set_index")
+  outcome                  PerformedSetOutcome @default(completed)
+  plannedRepetitions       Int?                @map("planned_repetitions")
+  plannedLoad              Decimal?            @map("planned_load") @db.Decimal(7, 2)
+  plannedLoadUnit          WeightUnit?         @map("planned_load_unit")
+  plannedLoadKg            Decimal?            @map("planned_load_kg") @db.Decimal(7, 2)
+  plannedDurationSeconds   Int?                @map("planned_duration_seconds")
+  performedRepetitions     Int?                @map("performed_repetitions")
+  performedLoad            Decimal?            @map("performed_load") @db.Decimal(7, 2)
+  performedLoadUnit        WeightUnit?         @map("performed_load_unit")
+  performedLoadKg          Decimal?            @map("performed_load_kg") @db.Decimal(7, 2)
+  performedDurationSeconds Int?                @map("performed_duration_seconds")
+  notes                    String?             @db.VarChar(500)
+  completedAt              DateTime            @map("completed_at") @db.Timestamptz(3)
+  createdAt                DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  exerciseSession ExerciseSession          @relation(fields: [exerciseSessionId], references: [id], onDelete: Restrict)
+  corrections     PerformedSetCorrection[]
+
+  @@unique([exerciseSessionId, setIndex])
+  @@map("performed_sets")
+  @@schema("meutreino")
+}
+
+model PerformedSetCorrection {
+  id                       String    @id @default(uuid()) @db.Uuid
+  performedSetId           String    @map("performed_set_id") @db.Uuid
+  correctedByUserId        String    @map("corrected_by_user_id") @db.Uuid
+  performedRepetitions     Int?      @map("performed_repetitions")
+  performedLoad            Decimal?  @map("performed_load") @db.Decimal(7, 2)
+  performedLoadUnit        WeightUnit? @map("performed_load_unit")
+  performedLoadKg          Decimal?  @map("performed_load_kg") @db.Decimal(7, 2)
+  performedDurationSeconds Int?      @map("performed_duration_seconds")
+  voided                   Boolean   @default(false)
+  reason                   String    @db.VarChar(300)
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  performedSet PerformedSet @relation(fields: [performedSetId], references: [id], onDelete: Restrict)
+  correctedBy  User         @relation(fields: [correctedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([performedSetId, createdAt])
+  @@map("performed_set_corrections")
+  @@schema("meutreino")
+}
+
+/// Subjective record supplied by the user. It is not a clinical assessment.
+model ExerciseFeedback {
+  id                 String   @id @db.Uuid
+  exerciseSessionId  String   @unique @map("exercise_session_id") @db.Uuid
+  userId             String   @map("user_id") @db.Uuid
+  perceivedLevel     Int?     @map("perceived_level") @db.SmallInt
+  comment            String?  @db.Text
+  discomfortReported Boolean  @default(false) @map("discomfort_reported")
+  discomfortNote     String?  @map("discomfort_note") @db.Text
+  version            Int      @default(1)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  exerciseSession ExerciseSession @relation(fields: [exerciseSessionId], references: [id], onDelete: Restrict)
+  user            User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@map("exercise_feedback")
+  @@schema("meutreino")
+}
+
+model ProfessionalProfile {
+  id          String             @id @default(uuid()) @db.Uuid
+  userId      String             @unique @map("user_id") @db.Uuid
+  displayName String             @map("display_name") @db.VarChar(120)
+  status      ProfessionalStatus @default(draft)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@map("professional_profiles")
+  @@schema("meutreino")
+}
+
+model StudentProfessionalLink {
+  id                 String     @id @default(uuid()) @db.Uuid
+  studentUserId      String     @map("student_user_id") @db.Uuid
+  professionalUserId String     @map("professional_user_id") @db.Uuid
+  invitedByUserId    String     @map("invited_by_user_id") @db.Uuid
+  status             LinkStatus @default(invited)
+  consentGrantedAt   DateTime?  @map("consent_granted_at") @db.Timestamptz(3)
+  revokedAt          DateTime?  @map("revoked_at") @db.Timestamptz(3)
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  student      User             @relation("StudentLinks", fields: [studentUserId], references: [id], onDelete: Restrict)
+  professional User             @relation("ProfessionalLinks", fields: [professionalUserId], references: [id], onDelete: Restrict)
+  invitedBy    User             @relation("LinkInviter", fields: [invitedByUserId], references: [id], onDelete: Restrict)
+  permissions  LinkPermission[]
+
+  @@unique([studentUserId, professionalUserId])
+  @@index([professionalUserId, status])
+  @@map("student_professional_links")
+  @@schema("meutreino")
+}
+
+model LinkPermission {
+  id         String                 @id @default(uuid()) @db.Uuid
+  linkId     String                 @map("link_id") @db.Uuid
+  permission ProfessionalPermission
+  grantedAt  DateTime               @default(now()) @map("granted_at") @db.Timestamptz(3)
+  revokedAt  DateTime?              @map("revoked_at") @db.Timestamptz(3)
+
+  link StudentProfessionalLink @relation(fields: [linkId], references: [id], onDelete: Restrict)
+
+  @@unique([linkId, permission])
+  @@map("link_permissions")
+  @@schema("meutreino")
+}
+
+/// Trial, renewal, and expiry originate from Apple or Google. There is no internal trial clock.
+model Subscription {
+  id                         String               @id @default(uuid()) @db.Uuid
+  userId                     String               @map("user_id") @db.Uuid
+  provider                   SubscriptionProvider
+  productCode                String               @map("product_code") @db.VarChar(120)
+  status                     SubscriptionStatus
+  environment                BillingEnvironment
+  storeOriginalTransactionId String               @map("store_original_transaction_id")
+  currentPeriodStart         DateTime             @map("current_period_start") @db.Timestamptz(3)
+  currentPeriodEnd           DateTime             @map("current_period_end") @db.Timestamptz(3)
+  willRenew                  Boolean              @map("will_renew")
+  createdAt                  DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                  DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user   User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  events SubscriptionEvent[]
+
+  @@unique([provider, storeOriginalTransactionId])
+  @@index([userId, status])
+  @@map("subscriptions")
+  @@schema("meutreino")
+}
+
+model SubscriptionEvent {
+  id              String               @id @default(uuid()) @db.Uuid
+  subscriptionId  String?              @map("subscription_id") @db.Uuid
+  provider        SubscriptionProvider
+  providerEventId String               @map("provider_event_id")
+  eventType       String               @map("event_type") @db.VarChar(120)
+  payloadHash     String               @map("payload_hash")
+  receivedAt      DateTime             @default(now()) @map("received_at") @db.Timestamptz(3)
+
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, providerEventId])
+  @@index([subscriptionId])
+  @@map("subscription_events")
+  @@schema("meutreino")
+}
+
+/// Detached from users so a store transaction id can outlive account deletion.
+model BillingRetentionRecord {
+  id                         String               @id @default(uuid()) @db.Uuid
+  formerUserId               String               @map("former_user_id") @db.Uuid
+  provider                   SubscriptionProvider
+  storeOriginalTransactionId String               @map("store_original_transaction_id")
+  retainUntil                DateTime             @map("retain_until") @db.Timestamptz(3)
+  createdAt                  DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([retainUntil])
+  @@map("billing_retention_records")
+  @@schema("meutreino")
+}
+
+model Device {
+  id             String         @id @default(uuid()) @db.Uuid
+  userId         String         @map("user_id") @db.Uuid
+  installationId String         @map("installation_id") @db.Uuid
+  platform       DevicePlatform
+  appVersion     String         @map("app_version") @db.VarChar(40)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastSeenAt     DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  sessions       AuthSession[]
+  syncOperations SyncOperation[]
+
+  @@unique([userId, installationId])
+  @@index([userId])
+  @@map("devices")
+  @@schema("meutreino")
+}
+
+/// Server receipt of a sync attempt. The payload itself stays on the entity tables and on the device.
+model SyncOperation {
+  id             String              @id @db.Uuid
+  userId         String              @map("user_id") @db.Uuid
+  deviceId       String              @map("device_id") @db.Uuid
+  entityType     SyncEntityType      @map("entity_type")
+  entityId       String              @map("entity_id") @db.Uuid
+  operation      SyncOperationType
+  idempotencyKey String              @unique @map("idempotency_key")
+  payloadHash    String              @map("payload_hash")
+  baseVersion    Int?                @map("base_version")
+  status         SyncOperationStatus @default(pending)
+  conflictCode   String?             @map("conflict_code") @db.VarChar(80)
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  appliedAt      DateTime?           @map("applied_at") @db.Timestamptz(3)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status, createdAt])
+  @@index([entityType, entityId])
+  @@map("sync_operations")
+  @@schema("meutreino")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  action      String   @db.VarChar(80)
+  entityType  String   @map("entity_type") @db.VarChar(80)
+  entityId    String   @map("entity_id") @db.Uuid
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId, createdAt])
+  @@map("audit_logs")
+  @@schema("meutreino")
+}
+
+/// Single-use email confirmation. Only the SHA-256 of the token is stored.
+model EmailVerificationToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("email_verification_tokens")
+  @@schema("meutreino")
+}
+
+/// Single-use password recovery. Only the SHA-256 of the token is stored.
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("password_reset_tokens")
+  @@schema("meutreino")
+}
+
+/// Confirms a new address before it replaces the current one.
+model EmailChangeToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  nextEmail String    @map("next_email") @db.Citext
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("email_change_tokens")
+  @@schema("meutreino")
+}
+
+/// Append-only security trail. Payloads must not contain tokens, passwords, or raw e-mail addresses.
+model SecurityAuditEvent {
+  id          String               @id @default(uuid()) @db.Uuid
+  userId      String?              @map("user_id") @db.Uuid
+  eventType   String               @map("event_type") @db.VarChar(80)
+  outcome     SecurityAuditOutcome
+  subjectHash String?              @map("subject_hash")
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("security_audit_events")
+  @@schema("meutreino")
+}

@@ -1,0 +1,37 @@
+{
+  "name": "meutreino-plus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MeuTreino+ monorepo: mobile app, API, and shared contracts.",
+  "engines": {
+    "node": ">=22.13.0 <25"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @meutreino/api",
+    "dev:mobile": "npm run dev -w @meutreino/mobile",
+    "lint": "npm run lint -w @meutreino/shared && npm run lint -w @meutreino/api && npm run lint -w @meutreino/mobile",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "npm run build -w @meutreino/shared && npm run typecheck -w @meutreino/api && npm run typecheck -w @meutreino/mobile",
+    "test": "npm run build -w @meutreino/shared && npm run test -w @meutreino/shared && npm run test -w @meutreino/api && npm run test -w @meutreino/mobile",
+    "test:e2e": "npm run test:e2e -w @meutreino/api",
+    "build": "npm run build -w @meutreino/shared && npm run build -w @meutreino/api && npm run build -w @meutreino/mobile",
+    "db:up": "docker compose -f infrastructure/docker-compose.yml up -d --wait",
+    "db:down": "docker compose -f infrastructure/docker-compose.yml down",
+    "db:generate": "npm run prisma:generate -w @meutreino/api",
+    "db:migrate": "npm run prisma:migrate -w @meutreino/api",
+    "validate": "bash scripts/validate.sh"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.72.0"
+  }
+}

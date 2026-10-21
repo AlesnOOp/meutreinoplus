@@ -1,0 +1,31 @@
+# Local development only. The password below is a documented default, not a production secret.
+name: meutreino
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: meutreino
+      POSTGRES_PASSWORD: meutreino
+      POSTGRES_DB: meutreino
+    ports:
+      - '5432:5432'
+    volumes:
+      - meutreino_pg:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U meutreino -d meutreino']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  mailpit:
+    image: axllent/mailpit:v1.28
+    restart: unless-stopped
+    ports:
+      - '1025:1025'
+      - '8025:8025'
+
+volumes:
+  meutreino_pg:
