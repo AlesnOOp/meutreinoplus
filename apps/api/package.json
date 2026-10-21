@@ -16,7 +16,9 @@
     "prebuild": "prisma generate",
     "pretypecheck": "prisma generate",
     "pretest": "prisma generate",
-    "pretest:e2e": "prisma generate"
+    "pretest:e2e": "prisma generate",
+    "test:security": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config jest.security.config.cjs --runInBand",
+    "pretest:security": "prisma generate"
   },
   "dependencies": {
     "@meutreino/shared": "*",

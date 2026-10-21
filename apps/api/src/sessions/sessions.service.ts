@@ -22,6 +22,7 @@ import { Prisma } from '../generated/prisma/client';
 import { sha256 } from '../identity/crypto';
 import { fail } from '../identity/http';
 import { PrismaService } from '../prisma/prisma.service';
+import { invalidSessionReferences, validateSessionReferences } from './session-reference-guard';
 
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 
@@ -65,6 +66,23 @@ export class SessionsService {
           if (existing.userId !== userId) {
             throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
           }
+          if (
+            existing.workoutPlanId !== input.planId ||
+            (input.gymId !== undefined && existing.gymId !== input.gymId)
+          )
+            invalidSessionReferences();
+          const children = await tx.exerciseSession.findMany({
+            where: { workoutSessionId: sessionId },
+          });
+          if (
+            input.exerciseSessions?.some(
+              (item) =>
+                !children.some(
+                  (child) => child.id === item.id && child.planExerciseId === item.planExerciseId,
+                ),
+            )
+          )
+            invalidSessionReferences();
           return this.present(tx, sessionId, userId, false);
         }
         const open = await tx.workoutSession.findFirst({
@@ -102,6 +120,20 @@ export class SessionsService {
           );
         }
         const snapshot = parsed.data;
+        const supplied = input.exerciseSessions ?? [];
+        if (
+          new Set(supplied.map((item) => item.id)).size !== supplied.length ||
+          new Set(supplied.map((item) => item.planExerciseId)).size !== supplied.length ||
+          supplied.some(
+            (item) => !snapshot.exercises.some((exercise) => exercise.id === item.planExerciseId),
+          )
+        ) {
+          invalidSessionReferences();
+        }
+        const collisions = await tx.exerciseSession.count({
+          where: { id: { in: supplied.map((item) => item.id) } },
+        });
+        if (collisions) invalidSessionReferences();
         let gymName: string | null = null;
         if (input.gymId) {
           const gym = await tx.gym.findFirst({ where: { id: input.gymId, ownerUserId: userId } });
@@ -280,6 +312,16 @@ export class SessionsService {
       if (!exercise) {
         throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Exercício não encontrado.');
       }
+      const referenced = await tx.performedSet.findUnique({ where: { id: input.id } });
+      if (referenced && referenced.exerciseSessionId !== exercise.id) invalidSessionReferences();
+      const snapshot = sessionPlanSnapshotSchema.parse(session.planSnapshot);
+      const plannedExercise = snapshot.exercises.find(
+        (item) => item.id === exercise.planExerciseId,
+      );
+      const planned = input.plannedSetId
+        ? plannedExercise?.sets.find((set) => set.id === input.plannedSetId)
+        : undefined;
+      if (input.plannedSetId && !planned) invalidSessionReferences();
       const existing = exercise.sets.find((set) => set.id === input.id);
       const stored = encodeLoad(input.load, input.loadUnit);
       const fingerprint = performedSetFingerprint({
@@ -312,16 +354,6 @@ export class SessionsService {
           'validation_error',
           'Informe as repetições ou a carga realizada. Peso corporal fica sem carga.',
         );
-      }
-      const snapshot = sessionPlanSnapshotSchema.parse(session.planSnapshot);
-      const plannedExercise = snapshot.exercises.find(
-        (item) => item.id === exercise.planExerciseId,
-      );
-      const planned = input.plannedSetId
-        ? plannedExercise?.sets.find((set) => set.id === input.plannedSetId)
-        : undefined;
-      if (input.plannedSetId && !planned) {
-        throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Série planejada não encontrada.');
       }
       const plannedLoad = encodeLoad(planned?.load ?? null, planned?.loadUnit);
       const setIndex =
@@ -385,6 +417,14 @@ export class SessionsService {
         throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Série não encontrada.');
       }
       const correctionId = input.id ?? randomUUID();
+      const referenced = await tx.performedSetCorrection.findUnique({
+        where: { id: correctionId },
+      });
+      if (
+        referenced &&
+        (referenced.performedSetId !== set.id || referenced.correctedByUserId !== userId)
+      )
+        invalidSessionReferences();
       const existing = set.corrections.find((correction) => correction.id === correctionId);
       if (existing) {
         return this.present(tx, sessionId, userId, false);
@@ -498,6 +538,12 @@ export class SessionsService {
       if (input.action === 'start' && input.durationSeconds == null) {
         throw fail(HttpStatus.BAD_REQUEST, 'validation_error', 'Informe a duração do descanso.');
       }
+      if (
+        input.exerciseSessionId &&
+        !session.exercises.some((exercise) => exercise.id === input.exerciseSessionId)
+      ) {
+        invalidSessionReferences();
+      }
       const instant = resolveInstant(input.occurredAt, session.startedAt);
       await tx.sessionTimeEvent.create({
         data: {
@@ -550,24 +596,17 @@ export class SessionsService {
         'A operação não confere com o conteúdo enviado.',
       );
     }
-    const existingOperation = await this.prisma.syncOperation.findUnique({
-      where: { idempotencyKey: operation.idempotencyKey },
-    });
-    if (existingOperation) {
-      if (existingOperation.userId !== userId || existingOperation.payloadHash !== hash) {
-        return { id: operation.id, status: 'rejected' as const, code: 'idempotency_key_reused' };
+    // Retry only transactional races. Every retry revalidates references before reading a receipt.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.mergeSynced(userId, deviceId, operation, payload);
+      } catch (error) {
+        const retryable =
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          (error.code === 'P2034' || error.code === 'P2002');
+        if (!retryable || attempt >= 2) throw error;
       }
-      if (existingOperation.status === 'applied') {
-        return { id: operation.id, status: 'applied' as const };
-      }
-      return {
-        id: operation.id,
-        status:
-          existingOperation.status === 'conflict' ? ('conflict' as const) : ('rejected' as const),
-        code: existingOperation.conflictCode ?? 'rejected',
-      };
     }
-    return this.mergeSynced(userId, deviceId, operation, payload);
   }
 
   async resolveConflict(
@@ -587,6 +626,7 @@ export class SessionsService {
     const payload = sessionSyncPayloadSchema.parse(conflict.payload);
     if (choice === 'keep_local' || choice === 'keep_both') {
       await this.mutate(userId, conflict.workoutSessionId, async (tx, session) => {
+        await validateSessionReferences(tx, userId, payload, session);
         await this.applyClientCorrections(tx, userId, session, payload);
         if (
           !isTerminal(session) &&
@@ -610,61 +650,95 @@ export class SessionsService {
     operation: PushOperation,
     payload: SessionSyncPayload,
   ) {
-    let status: 'applied' | 'conflict' | 'rejected' = 'applied';
-    let code: string | undefined;
-    await this.prisma.$transaction(async (tx) => {
-      const existing = await tx.workoutSession.findUnique({
-        where: { id: payload.id },
-        include: sessionInclude,
-      });
-      if (existing && existing.userId !== userId) {
-        throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
-      }
-      if (!existing) {
-        const created = await this.createFromSync(tx, userId, payload);
-        status = created.status;
-        code = created.code;
-      } else {
-        const merged = await this.mergeExisting(
-          tx,
-          userId,
-          existing,
-          payload,
-          operation.baseVersion,
-        );
-        status = merged.status;
-        code = merged.code;
-      }
-      if (status === 'conflict') {
-        await tx.workoutSessionConflict.create({
+    return this.prisma.$transaction(
+      async (tx) => {
+        let status: 'applied' | 'conflict' | 'rejected' = 'applied';
+        let code: string | undefined;
+        const existing = await tx.workoutSession.findUnique({
+          where: { id: payload.id },
+          include: sessionInclude,
+        });
+        await validateSessionReferences(tx, userId, payload, existing);
+        const device = await tx.device.findFirst({
+          where: { id: deviceId, userId },
+          select: { id: true },
+        });
+        if (!device) invalidSessionReferences();
+        const receipt = await tx.syncOperation.findUnique({
+          where: { idempotencyKey: operation.idempotencyKey },
+        });
+        if (receipt) {
+          if (
+            receipt.userId !== userId ||
+            receipt.payloadHash !== operation.payloadHash ||
+            receipt.entityType !== operation.entityType ||
+            receipt.entityId !== operation.entityId ||
+            receipt.operation !== operation.operation
+          ) {
+            return {
+              id: operation.id,
+              status: 'rejected' as const,
+              code: 'idempotency_key_reused',
+            };
+          }
+          return {
+            id: operation.id,
+            status:
+              receipt.status === 'applied'
+                ? ('applied' as const)
+                : receipt.status === 'conflict'
+                  ? ('conflict' as const)
+                  : ('rejected' as const),
+            ...(receipt.conflictCode ? { code: receipt.conflictCode } : {}),
+          };
+        }
+        if (!existing) {
+          const created = await this.createFromSync(tx, userId, payload);
+          status = created.status;
+          code = created.code;
+        } else {
+          const merged = await this.mergeExisting(
+            tx,
+            userId,
+            existing,
+            payload,
+            operation.baseVersion,
+          );
+          status = merged.status;
+          code = merged.code;
+        }
+        if (status === 'conflict') {
+          await tx.workoutSessionConflict.create({
+            data: {
+              id: operation.id,
+              userId,
+              workoutSessionId: payload.id,
+              baseVersion: operation.baseVersion,
+              payload: jsonValue(payload),
+              status: 'open',
+            },
+          });
+        }
+        await tx.syncOperation.create({
           data: {
             id: operation.id,
             userId,
-            workoutSessionId: payload.id,
+            deviceId,
+            entityType: 'workout_session',
+            entityId: payload.id,
+            operation: 'upsert',
+            idempotencyKey: operation.idempotencyKey,
+            payloadHash: operation.payloadHash,
             baseVersion: operation.baseVersion,
-            payload: jsonValue(payload),
-            status: 'open',
+            status,
+            conflictCode: code,
+            appliedAt: status === 'applied' ? new Date() : null,
           },
         });
-      }
-      await tx.syncOperation.create({
-        data: {
-          id: operation.id,
-          userId,
-          deviceId,
-          entityType: 'workout_session',
-          entityId: payload.id,
-          operation: 'upsert',
-          idempotencyKey: operation.idempotencyKey,
-          payloadHash: operation.payloadHash,
-          baseVersion: operation.baseVersion,
-          status,
-          conflictCode: code,
-          appliedAt: status === 'applied' ? new Date() : null,
-        },
-      });
-    });
-    return { id: operation.id, status, ...(code ? { code } : {}) };
+        return { id: operation.id, status, ...(code ? { code } : {}) };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
   }
 
   private async createFromSync(
@@ -1043,23 +1117,26 @@ export class SessionsService {
     sessionId: string,
     change: (tx: Tx, session: LoadedSession) => Promise<T>,
   ): Promise<T> {
-    return this.prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<{ id: string }[]>`
+    return this.prisma.$transaction(
+      async (tx) => {
+        const locked = await tx.$queryRaw<{ id: string }[]>`
         SELECT id FROM meutreino.workout_sessions
         WHERE id = ${sessionId}::uuid AND user_id = ${userId}::uuid
         FOR UPDATE`;
-      if (locked.length === 0) {
-        throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
-      }
-      const session = await tx.workoutSession.findFirst({
-        where: { id: sessionId, userId },
-        include: sessionInclude,
-      });
-      if (!session) {
-        throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
-      }
-      return change(tx, session);
-    });
+        if (locked.length === 0) {
+          throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
+        }
+        const session = await tx.workoutSession.findFirst({
+          where: { id: sessionId, userId },
+          include: sessionInclude,
+        });
+        if (!session) {
+          throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Treino não encontrado.');
+        }
+        return change(tx, session);
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
   }
 
   private async present(
