@@ -99,6 +99,10 @@ for (const choice of ['keep_server', 'keep_local', 'keep_both']) {
         resolveSessionConflictRequest: async () => ({ payload: remote, version: 7 }),
       },
       '@/db/local-database': { openLocalDatabase: async () => database },
+      '@/db/sync-state': {
+        revision: async () => ({ local_revision: 0 }),
+        localTransaction: async (db, work) => db.withTransactionAsync(() => work(db)),
+      },
       '@/plans/plan-store': {},
     });
     await store.resolveLocalSessionConflict('user', 'session', choice);

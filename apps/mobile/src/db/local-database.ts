@@ -5,7 +5,7 @@ import {
 } from '@meutreino/shared';
 import * as SQLite from 'expo-sqlite';
 
-const SCHEMA_VERSION = '4';
+const SCHEMA_VERSION = '5';
 
 export type LocalDatabaseStatus = {
   ready: true;
@@ -136,6 +136,10 @@ async function initialize(userId: string): Promise<SQLite.SQLiteDatabase> {
 }
 
 async function migrateSchema(database: SQLite.SQLiteDatabase): Promise<void> {
+  await database.withTransactionAsync(() => migrateSchemaInTransaction(database));
+}
+
+async function migrateSchemaInTransaction(database: SQLite.SQLiteDatabase): Promise<void> {
   const version = await database.getFirstAsync<{ value: string }>(
     `SELECT value FROM local_meta WHERE key = 'schema_version'`,
   );
@@ -170,6 +174,43 @@ async function migrateSchema(database: SQLite.SQLiteDatabase): Promise<void> {
     'exercises',
     'synced',
     `ALTER TABLE exercises ADD COLUMN synced INTEGER NOT NULL DEFAULT 0`,
+  );
+  // Recovery 02: revisions are logical counters, independent of wall-clock time.
+  for (const table of ['gyms', 'equipment', 'exercises', 'sessions']) {
+    await ensureColumn(
+      database,
+      table,
+      'local_revision',
+      `ALTER TABLE ${table} ADD COLUMN local_revision INTEGER NOT NULL DEFAULT 0`,
+    );
+    await ensureColumn(
+      database,
+      table,
+      'acknowledged_revision',
+      `ALTER TABLE ${table} ADD COLUMN acknowledged_revision INTEGER NOT NULL DEFAULT 0`,
+    );
+    await ensureColumn(
+      database,
+      table,
+      'stale_remote_version',
+      `ALTER TABLE ${table} ADD COLUMN stale_remote_version INTEGER`,
+    );
+    if (version?.value !== SCHEMA_VERSION) {
+      // Legacy queue entries remain revision 0. Dirty local rows get a newer revision;
+      // the sync pass durably enqueues their latest payload before sending old entries.
+      await database.runAsync(
+        `UPDATE ${table} SET local_revision = 1 WHERE pending = 1 AND local_revision = 0`,
+      );
+      if (table !== 'sessions')
+        await database.runAsync(`UPDATE ${table} SET version = 0 WHERE synced = 0`);
+      await database.runAsync(`UPDATE ${table} SET synced = 0 WHERE pending = 1`);
+    }
+  }
+  await ensureColumn(
+    database,
+    'sync_queue',
+    'local_revision',
+    `ALTER TABLE sync_queue ADD COLUMN local_revision INTEGER NOT NULL DEFAULT 0`,
   );
   await database.runAsync(
     `INSERT INTO local_meta (key, value) VALUES ('schema_version', ?)
@@ -215,7 +256,7 @@ export async function readLocalDatabaseStatus(userId: string): Promise<LocalData
   );
   const counts = await database.getFirstAsync<CountRow>(
     `SELECT
-       COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+       COALESCE(SUM(CASE WHEN status IN ('pending', 'in_flight') THEN 1 ELSE 0 END), 0) AS pending,
        COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
      FROM sync_queue`,
   );

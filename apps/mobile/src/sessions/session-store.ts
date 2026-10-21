@@ -15,6 +15,17 @@ import {
   startSessionRequest,
 } from '@/api/sessions';
 import { openLocalDatabase } from '@/db/local-database';
+import {
+  acknowledge,
+  canApplyRemote,
+  captureRevisions,
+  claimOperations,
+  hasPending,
+  localTransaction,
+  releaseOperations,
+  revision,
+  singleSync,
+} from '@/db/sync-state';
 import { readLocalPlan, syncPlans } from '@/plans/plan-store';
 
 type Database = Awaited<ReturnType<typeof openLocalDatabase>>;
@@ -30,16 +41,8 @@ type SessionRow = {
   pending: number;
   synced: number;
   conflict_operation_id: string | null;
-};
-
-type QueueRow = {
-  id: string;
-  entity_id: string;
-  idempotency_key: string;
-  payload_hash: string;
-  payload: string;
-  base_version: number | null;
-  created_at: string;
+  local_revision: number;
+  acknowledged_revision: number;
 };
 
 export type LocalSession = SessionSyncPayload & {
@@ -147,6 +150,11 @@ export async function startLocalSession(
   if (!online || !synced.synced || synced.conflicts > 0) {
     return (await readLocalSession(userId, sessionId))!;
   }
+  const startedRevision = (await revision(
+    await openLocalDatabase(userId),
+    'workout_session',
+    sessionId,
+  ))!.local_revision;
   try {
     const remote = await startSessionRequest({
       id: sessionId,
@@ -158,14 +166,50 @@ export async function startLocalSession(
         planExerciseId: exercise.planExerciseId,
       })),
     });
-    await persist(userId, remote.payload, remote.version, false);
+    const database = await openLocalDatabase(userId);
+    await localTransaction(database, async (tx) => {
+      await tx.runAsync(
+        `UPDATE sessions SET server_version = MAX(server_version, ?) WHERE id = ?`,
+        remote.version,
+        sessionId,
+      );
+      const current = await revision(tx, 'workout_session', sessionId);
+      if (current?.local_revision === startedRevision) {
+        // This REST call created only the initial state; confirm only that revision's queue row.
+        await tx.runAsync(
+          `UPDATE sync_queue SET status = 'done' WHERE entity_type = 'workout_session' AND entity_id = ? AND local_revision = ?`,
+          sessionId,
+          startedRevision,
+        );
+        await tx.runAsync(
+          `UPDATE sessions SET pending = 0, synced = 1, acknowledged_revision = ? WHERE id = ?`,
+          startedRevision,
+          sessionId,
+        );
+      }
+      await tx.runAsync(
+        `UPDATE sync_queue SET base_version = ? WHERE entity_type = 'workout_session' AND entity_id = ? AND status = 'pending' AND attempt_count = 0`,
+        remote.version,
+        sessionId,
+      );
+    });
+    await applyRemoteSession(userId, remote.payload, remote.version, startedRevision);
     return (await readLocalSession(userId, remote.payload.id))!;
   } catch (error) {
     if (error instanceof ApiClientError && error.code === 'session_open') {
       const remote = await openSessionRequest();
       if (remote.session) {
-        await persist(userId, remote.session.payload, remote.session.version, false);
-        await discardLocal(userId, sessionId);
+        await applyRemoteSession(userId, remote.session.payload, remote.session.version, 0);
+        const database = await openLocalDatabase(userId);
+        await localTransaction(database, async (tx) => {
+          if (
+            (await revision(tx, 'workout_session', sessionId))?.local_revision === startedRevision
+          ) {
+            await discardLocal(tx, sessionId);
+          }
+        });
+        if (await readLocalSession(userId, sessionId))
+          return (await readLocalSession(userId, sessionId))!;
         return (await readLocalSession(userId, remote.session.payload.id))!;
       }
     }
@@ -325,30 +369,21 @@ export async function finishLocalSession(
   });
 }
 
-export async function syncSessions(
-  userId: string,
-): Promise<{ synced: boolean; conflicts: number }> {
+export function syncSessions(userId: string): Promise<{ synced: boolean; conflicts: number }> {
+  return singleSync(userId, 'sessions', () => runSessionSync(userId));
+}
+
+async function runSessionSync(userId: string): Promise<{ synced: boolean; conflicts: number }> {
   const plans = await syncPlans(userId).catch((error: unknown) => {
-    if (isNetworkError(error)) {
-      return { synced: false, conflicts: 0 };
-    }
+    if (isNetworkError(error)) return { synced: false, conflicts: 0 };
     throw error;
   });
   const database = await openLocalDatabase(userId);
   await adoptSyncedPlans(userId, database);
-  const queued = await database.getAllAsync<QueueRow>(
-    `SELECT id, entity_id, idempotency_key, payload_hash, payload, base_version, created_at
-     FROM sync_queue WHERE status = 'pending' AND entity_type = 'workout_session' ORDER BY created_at ASC LIMIT 20`,
-  );
+  const queued = await claimOperations(database, ['workout_session']);
   let conflicts = plans.conflicts;
-  if (queued.length > 0) {
-    const ids = queued.map((row) => row.id);
-    await database.runAsync(
-      `UPDATE sync_queue SET status = 'in_flight', updated_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
-      new Date().toISOString(),
-      ...ids,
-    );
-    try {
+  try {
+    if (queued.length) {
       const result = await pushSessionSync(
         queued.map((row) => ({
           id: row.id,
@@ -364,76 +399,59 @@ export async function syncSessions(
       );
       for (const item of result.results) {
         const row = queued.find((candidate) => candidate.id === item.id);
-        if (!row) {
-          continue;
-        }
-        if (item.code === 'session_open' || item.code === 'plan_not_synced') {
-          await database.runAsync(
-            `UPDATE sync_queue SET status = 'pending', last_error = ?, updated_at = ? WHERE id = ?`,
-            item.code,
-            new Date().toISOString(),
-            item.id,
-          );
-          continue;
-        }
+        if (!row) continue;
+        if (item.code === 'session_open' || item.code === 'plan_not_synced') continue;
         if (item.status === 'applied') {
-          await database.runAsync(
-            `UPDATE sync_queue SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`,
-            new Date().toISOString(),
-            item.id,
-          );
-          const openQueue = await database.getFirstAsync<{ id: string }>(
-            `SELECT id FROM sync_queue WHERE entity_id = ? AND status IN ('pending', 'in_flight', 'error')`,
-            row.entity_id,
-          );
-          if (!openQueue) {
-            const remote = await getSessionRequest(row.entity_id).catch(() => null);
-            if (remote) {
-              await persist(userId, remote.payload, remote.version, false);
-            }
-          }
+          await acknowledge(database, row);
+          const beforeGet = await revision(database, 'workout_session', row.entity_id);
+          const remote = await getSessionRequest(row.entity_id).catch(() => null);
+          if (remote)
+            await applyRemoteSession(
+              userId,
+              remote.payload,
+              remote.version,
+              beforeGet?.local_revision ?? 0,
+            );
         } else {
           conflicts += item.status === 'conflict' ? 1 : 0;
-          await database.runAsync(
-            `UPDATE sync_queue SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`,
-            item.code ?? item.status,
-            new Date().toISOString(),
-            item.id,
-          );
-          if (item.status === 'conflict') {
-            await database.runAsync(
-              `UPDATE sessions SET conflict_operation_id = ?, pending = 1 WHERE id = ?`,
+          await localTransaction(database, async (tx) => {
+            await tx.runAsync(
+              `UPDATE sync_queue SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`,
+              item.code ?? item.status,
+              new Date().toISOString(),
               item.id,
-              row.entity_id,
             );
-          }
+            if (item.status === 'conflict')
+              await tx.runAsync(
+                `UPDATE sessions SET conflict_operation_id = ?, pending = 1, synced = 0 WHERE id = ?`,
+                item.id,
+                row.entity_id,
+              );
+          });
         }
       }
-    } catch (error) {
-      await database.runAsync(
-        `UPDATE sync_queue SET status = 'pending', updated_at = ? WHERE status = 'in_flight' AND entity_type = 'workout_session'`,
-        new Date().toISOString(),
-      );
-      if (isNetworkError(error)) {
-        return { synced: false, conflicts };
-      }
-      throw error;
     }
-  }
-  try {
+    await releaseOperations(database, queued);
+    const captured = await captureRevisions(database, 'workout_session');
     const remote = await openSessionRequest();
-    if (remote.session) {
-      const local = await readLocalSession(userId, remote.session.payload.id);
-      if (!local || (!local.pending && !local.conflictOperationId)) {
-        await persist(userId, remote.session.payload, remote.session.version, false);
-      }
-    }
+    if (remote.session)
+      await applyRemoteSession(
+        userId,
+        remote.session.payload,
+        remote.session.version,
+        captured.get(remote.session.payload.id)?.local_revision ?? 0,
+      );
   } catch (error) {
-    if (isNetworkError(error)) {
-      return { synced: false, conflicts };
-    }
+    await releaseOperations(database, queued);
+    if (isNetworkError(error)) return { synced: false, conflicts };
+    throw error;
   }
-  return { synced: true, conflicts };
+  return {
+    synced:
+      plans.synced &&
+      !(await hasPending(database, ['workout_session', 'gym', 'equipment', 'exercise'])),
+    conflicts,
+  };
 }
 
 export async function resolveLocalSessionConflict(
@@ -445,19 +463,34 @@ export async function resolveLocalSessionConflict(
   if (!current?.conflictOperationId) {
     return;
   }
-  const remote = await resolveSessionConflictRequest(current.conflictOperationId, choice);
-  // The server has already reconciled the choice and created immutable corrections.
-  await persist(userId, remote.payload, remote.version, false);
   const database = await openLocalDatabase(userId);
-  await database.runAsync(
-    `UPDATE sync_queue SET status = 'done', updated_at = ? WHERE id = ?`,
-    new Date().toISOString(),
-    current.conflictOperationId,
-  );
-  await database.runAsync(
-    `UPDATE sessions SET conflict_operation_id = NULL WHERE id = ?`,
-    sessionId,
-  );
+  const captured = await revision(database, 'workout_session', sessionId);
+  const remote = await resolveSessionConflictRequest(current.conflictOperationId, choice);
+  await localTransaction(database, async (tx) => {
+    const latest = await revision(tx, 'workout_session', sessionId);
+    if ((latest?.local_revision ?? 0) !== (captured?.local_revision ?? 0)) {
+      await tx.runAsync(
+        `UPDATE sessions SET stale_remote_version = ? WHERE id = ?`,
+        remote.version,
+        sessionId,
+      );
+      return; // Preserve the explicit conflict state and all subsequent local edits (Achado 04).
+    }
+    await writeSession(
+      tx,
+      remote.payload,
+      remote.version,
+      false,
+      latest?.local_revision ?? 0,
+      null,
+    );
+    await tx.runAsync(
+      `UPDATE sync_queue SET status = 'done', updated_at = ? WHERE id = ?`,
+      new Date().toISOString(),
+      current.conflictOperationId,
+    );
+    await tx.runAsync(`UPDATE sessions SET conflict_operation_id = NULL WHERE id = ?`, sessionId);
+  });
 }
 
 export function visibleSets(session: SessionSyncPayload, exerciseSessionId: string) {
@@ -472,16 +505,19 @@ async function changeSession(
   sessionId: string,
   change: (session: SessionSyncPayload) => void,
 ): Promise<LocalSession> {
-  const current = await readLocalSession(userId, sessionId);
-  if (!current) {
-    throw new Error('Treino não encontrado.');
-  }
-  if (current.status === 'completed' || current.status === 'aborted') {
-    throw new Error('Este treino já foi encerrado.');
-  }
-  change(current);
-  const parsed = sessionSyncPayloadSchema.parse(current);
-  await persist(userId, parsed, current.serverVersion, current.conflictOperationId == null);
+  const database = await openLocalDatabase(userId);
+  await localTransaction(database, async (tx) => {
+    const row = await tx.getFirstAsync<SessionRow>(
+      `SELECT * FROM sessions WHERE id = ?`,
+      sessionId,
+    );
+    if (!row) throw new Error('Treino não encontrado.');
+    const current = mapSession(row);
+    if (current.status === 'completed' || current.status === 'aborted')
+      throw new Error('Este treino já foi encerrado.');
+    change(current);
+    await persistLocal(tx, userId, sessionSyncPayloadSchema.parse(current), current.serverVersion);
+  });
   return (await readLocalSession(userId, sessionId))!;
 }
 
@@ -489,72 +525,107 @@ async function persist(
   userId: string,
   payload: SessionSyncPayload,
   serverVersion: number,
-  queue: boolean,
+  _queue: boolean,
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
+  await localTransaction(database, (tx) => persistLocal(tx, userId, payload, serverVersion));
+}
+
+async function writeSession(
+  database: Database,
+  payload: SessionSyncPayload,
+  serverVersion: number,
+  pending: boolean,
+  localRevision: number,
+  conflictId: string | null,
+): Promise<void> {
   const stored = sessionSyncPayloadSchema.parse(payload);
-  const now = new Date().toISOString();
+  await database.runAsync(
+    `INSERT INTO sessions (
+      id,status,plan_id,plan_name,server_version,payload,updated_at,pending,synced,conflict_operation_id,local_revision
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+      status=excluded.status, plan_name=excluded.plan_name, server_version=excluded.server_version,
+      payload=excluded.payload, updated_at=excluded.updated_at, pending=excluded.pending, synced=excluded.synced,
+      conflict_operation_id=excluded.conflict_operation_id, local_revision=excluded.local_revision`,
+    stored.id,
+    stored.status,
+    stored.planId,
+    stored.planName,
+    serverVersion,
+    JSON.stringify(stored),
+    new Date().toISOString(),
+    pending ? 1 : 0,
+    pending ? 0 : 1,
+    conflictId,
+    localRevision,
+  );
+}
+
+async function persistLocal(
+  database: Database,
+  userId: string,
+  payload: SessionSyncPayload,
+  serverVersion: number,
+): Promise<void> {
   const existing = await database.getFirstAsync<SessionRow>(
     `SELECT * FROM sessions WHERE id = ?`,
-    stored.id,
+    payload.id,
   );
-  const ready =
-    queue && !existing?.conflict_operation_id ? await readyPayload(userId, stored) : null;
-  await database.withTransactionAsync(async () => {
-    await database.runAsync(
-      `INSERT INTO sessions (
-        id, status, plan_id, plan_name, server_version, payload, updated_at, pending, synced, conflict_operation_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        status = excluded.status,
-        plan_name = excluded.plan_name,
-        server_version = excluded.server_version,
-        payload = excluded.payload,
-        updated_at = excluded.updated_at,
-        pending = excluded.pending,
-        synced = excluded.synced`,
-      stored.id,
-      stored.status,
-      stored.planId,
-      stored.planName,
-      serverVersion,
-      JSON.stringify(stored),
-      now,
-      queue ? 1 : 0,
-      queue ? (existing?.synced ?? 0) : 1,
-      existing?.conflict_operation_id ?? null,
-    );
-    if (!queue) {
-      await database.runAsync(
-        `DELETE FROM sync_queue WHERE entity_id = ? AND entity_type = 'workout_session' AND status IN ('pending', 'error')`,
-        stored.id,
-      );
+  const next = (existing?.local_revision ?? 0) + 1;
+  await writeSession(
+    database,
+    payload,
+    Math.max(serverVersion, existing?.server_version ?? 0),
+    true,
+    next,
+    existing?.conflict_operation_id ?? null,
+  );
+  if (!existing?.conflict_operation_id) {
+    const ready = await readyPayload(userId, payload);
+    if (ready)
+      await enqueueSession(database, ready, existing?.server_version ?? serverVersion, next);
+  }
+}
+
+async function enqueueSession(
+  database: Database,
+  stored: SessionSyncPayload,
+  serverVersion: number,
+  localRevision: number,
+): Promise<void> {
+  const ready = sessionSyncPayloadSchema.parse(stored);
+  const payloadHash = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    canonicalJsonString(ready),
+  );
+  const now = new Date().toISOString();
+  await database.runAsync(
+    `INSERT INTO sync_queue (
+      id,entity_type,entity_id,operation,idempotency_key,payload_hash,payload,base_version,status,created_at,updated_at,local_revision
+    ) VALUES (?,'workout_session',?,'upsert',?,?,?,?,'pending',?,?,?)`,
+    Crypto.randomUUID(),
+    ready.id,
+    Crypto.randomUUID(),
+    payloadHash,
+    JSON.stringify(ready),
+    serverVersion > 0 ? serverVersion : null,
+    now,
+    now,
+    localRevision,
+  );
+}
+
+async function applyRemoteSession(
+  userId: string,
+  payload: SessionSyncPayload,
+  serverVersion: number,
+  expectedRevision: number,
+): Promise<void> {
+  const database = await openLocalDatabase(userId);
+  await localTransaction(database, async (tx) => {
+    if (!(await canApplyRemote(tx, 'workout_session', payload.id, expectedRevision, serverVersion)))
       return;
-    }
-    if (!ready) {
-      return;
-    }
-    const payloadHash = await Crypto.digestStringAsync(
-      Crypto.CryptoDigestAlgorithm.SHA256,
-      canonicalJsonString(ready),
-    );
-    await database.runAsync(
-      `DELETE FROM sync_queue WHERE entity_id = ? AND entity_type = 'workout_session' AND status IN ('pending', 'error')`,
-      stored.id,
-    );
-    await database.runAsync(
-      `INSERT INTO sync_queue (
-        id, entity_type, entity_id, operation, idempotency_key, payload_hash, payload, base_version, status, created_at, updated_at
-      ) VALUES (?, 'workout_session', ?, 'upsert', ?, ?, ?, ?, 'pending', ?, ?)`,
-      Crypto.randomUUID(),
-      stored.id,
-      Crypto.randomUUID(),
-      payloadHash,
-      JSON.stringify(ready),
-      serverVersion > 0 ? serverVersion : null,
-      now,
-      now,
-    );
+    await writeSession(tx, payload, serverVersion, false, expectedRevision, null);
   });
 }
 
@@ -588,24 +659,34 @@ async function readyPayload(
 }
 
 async function adoptSyncedPlans(userId: string, database: Database): Promise<void> {
-  const rows = await database.getAllAsync<SessionRow>(`SELECT * FROM sessions WHERE pending = 1`);
-  for (const row of rows) {
-    const session = mapSession(row);
-    if (session.planVersion >= 1 || session.conflictOperationId) {
-      continue;
+  await localTransaction(database, async (tx) => {
+    const rows = await tx.getAllAsync<SessionRow>(`SELECT * FROM sessions WHERE pending = 1`);
+    for (const row of rows) {
+      if (row.conflict_operation_id) continue;
+      const session = mapSession(row);
+      const ready = await readyPayload(userId, session);
+      if (!ready) continue; // Explicit dirty state retained until its plan dependency can be sent.
+      const queued = await tx.getFirstAsync(
+        `SELECT id FROM sync_queue WHERE entity_type = 'workout_session' AND entity_id = ? AND local_revision = ? AND status IN ('pending','in_flight','error')`,
+        row.id,
+        row.local_revision,
+      );
+      if (!queued) {
+        await tx.runAsync(
+          `UPDATE sessions SET payload = ? WHERE id = ?`,
+          JSON.stringify(ready),
+          row.id,
+        );
+        await enqueueSession(tx, ready, row.server_version, row.local_revision);
+      }
     }
-    const ready = await readyPayload(userId, session);
-    if (ready) {
-      await persist(userId, ready, session.serverVersion, true);
-    }
-  }
+  });
 }
 
-async function discardLocal(userId: string, sessionId: string): Promise<void> {
-  const database = await openLocalDatabase(userId);
+async function discardLocal(database: Database, sessionId: string): Promise<void> {
   await database.runAsync(`DELETE FROM sessions WHERE id = ?`, sessionId);
   await database.runAsync(
-    `DELETE FROM sync_queue WHERE entity_id = ? AND entity_type = 'workout_session' AND status IN ('pending', 'error')`,
+    `DELETE FROM sync_queue WHERE entity_id = ? AND entity_type = 'workout_session' AND status IN ('pending','error')`,
     sessionId,
   );
 }

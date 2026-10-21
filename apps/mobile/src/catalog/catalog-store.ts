@@ -14,23 +14,26 @@ import {
 } from '@meutreino/shared';
 import * as Crypto from 'expo-crypto';
 import {
-  archiveEquipmentRequest,
-  archiveExerciseRequest,
-  archiveGymRequest,
-  createEquipmentRequest,
-  createExerciseRequest,
-  createGymRequest,
   deleteEquipmentPhotoRequest,
   pullCatalogSnapshot,
   pushCatalogSync,
-  updateEquipmentRequest,
-  updateExerciseRequest,
-  updateGymRequest,
   uploadEquipmentPhotoRequest,
 } from '@/api/catalog';
 import { isNetworkError } from '@/api/errors';
 import { openLocalDatabase } from '@/db/local-database';
-import { retainedLocalIds, syncBaseVersion } from '@/catalog/merge';
+import {
+  acknowledge,
+  canApplyRemote,
+  captureRevisions,
+  claimOperations,
+  hasPending,
+  localTransaction,
+  releaseOperations,
+  revision,
+  singleSync,
+  syncTable,
+  type QueuedRevision,
+} from '@/db/sync-state';
 
 type Database = Awaited<ReturnType<typeof openLocalDatabase>>;
 
@@ -85,92 +88,38 @@ export async function saveGym(
   online: boolean,
 ): Promise<GymView> {
   const database = await openLocalDatabase(userId);
-  const current = input.id
-    ? await database.getFirstAsync<GymRow>(`SELECT * FROM gyms WHERE id = ?`, input.id)
-    : null;
-  if (online) {
-    try {
-      const saved = current
-        ? await updateGymRequest(current.id, input)
-        : await createGymRequest(input);
-      if (saved.isPreferred) {
-        await database.runAsync(`UPDATE gyms SET is_preferred = 0 WHERE id <> ?`, saved.id);
-      }
-      await writeGym(database, saved, 0, 1);
-      return saved;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
+  const id = await localTransaction(database, async (tx) => {
+    const current = input.id
+      ? await tx.getFirstAsync<GymRow>(`SELECT * FROM gyms WHERE id = ?`, input.id)
+      : null;
+    const view = gymFromWrite(current, input);
+    if (view.isPreferred) {
+      const others = await tx.getAllAsync<GymRow>(
+        `SELECT * FROM gyms WHERE is_preferred = 1 AND id <> ?`,
+        view.id,
+      );
+      for (const other of others)
+        await saveCatalogRevision(tx, 'gym', { ...mapGym(other), isPreferred: false });
     }
-  }
-  const view = gymFromWrite(current, input);
-  if (view.isPreferred) {
-    await database.runAsync(`UPDATE gyms SET is_preferred = 0 WHERE id <> ?`, view.id);
-  }
-  await writeGym(database, view, 1, current?.synced ?? 0);
-  await enqueue(
-    database,
-    'gym',
-    view.id,
-    current?.synced ? syncBaseVersion(current.version) : null,
-    gymSyncPayloadSchema.parse({
-      id: view.id,
-      name: view.name,
-      nickname: view.nickname,
-      branchName: view.branchName,
-      city: view.city,
-      notes: view.notes,
-      isPreferred: view.isPreferred,
-      status: view.status,
-    }),
-  );
-  return view;
+    await saveCatalogRevision(tx, 'gym', view);
+    return view.id;
+  });
+  if (online) await syncCatalog(userId);
+  return (await readLocalGym(userId, id))!;
 }
 
 export async function archiveGym(userId: string, gymId: string, online: boolean): Promise<void> {
   const database = await openLocalDatabase(userId);
-  const current = await database.getFirstAsync<GymRow>(`SELECT * FROM gyms WHERE id = ?`, gymId);
-  if (!current) {
-    return;
-  }
-  if (!current.synced) {
-    await database.runAsync(
-      `DELETE FROM sync_queue WHERE entity_id = ? AND status = 'pending'`,
-      gymId,
-    );
-    await database.runAsync(`DELETE FROM gyms WHERE id = ?`, gymId);
-    return;
-  }
-  if (online) {
-    try {
-      const saved = await archiveGymRequest(gymId);
-      await writeGym(database, saved, 0, 1);
-      return;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
-  const view = { ...mapGym(current), status: 'archived' as const, isPreferred: false };
-  await writeGym(database, view, 1, 1);
-  await enqueue(
-    database,
-    'gym',
-    gymId,
-    syncBaseVersion(current.version),
-    gymSyncPayloadSchema.parse({
-      id: view.id,
-      name: view.name,
-      nickname: view.nickname,
-      branchName: view.branchName,
-      city: view.city,
-      notes: view.notes,
-      isPreferred: false,
-      status: 'archived',
-    }),
-  );
+  await localTransaction(database, async (tx) => {
+    const current = await tx.getFirstAsync<GymRow>(`SELECT * FROM gyms WHERE id = ?`, gymId);
+    if (current)
+      await saveCatalogRevision(tx, 'gym', {
+        ...mapGym(current),
+        status: 'archived',
+        isPreferred: false,
+      });
+  });
+  if (online) await syncCatalog(userId);
 }
 
 export async function listLocalEquipment(userId: string, gymId?: string): Promise<EquipmentView[]> {
@@ -208,45 +157,20 @@ export async function saveEquipment(
   online: boolean,
 ): Promise<EquipmentView> {
   const database = await openLocalDatabase(userId);
-  const current = input.id
-    ? await database.getFirstAsync<EquipmentRow>(
-        `SELECT * FROM equipment WHERE id = ? AND gym_id = ?`,
-        input.id,
-        gymId,
-      )
-    : null;
-  if (online) {
-    try {
-      const saved = current
-        ? await updateEquipmentRequest(gymId, current.id, input)
-        : await createEquipmentRequest(gymId, input);
-      await writeEquipment(database, saved, 0, 1, current);
-      return saved;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
-  const view = equipmentFromWrite(current, gymId, input);
-  await writeEquipment(database, view, 1, current?.synced ?? 0, current);
-  await enqueue(
-    database,
-    'equipment',
-    view.id,
-    current?.synced ? syncBaseVersion(current.version) : null,
-    equipmentSyncPayloadSchema.parse({
-      id: view.id,
-      gymId: view.gymId,
-      name: view.name,
-      machineNumber: view.machineNumber,
-      nickname: view.nickname,
-      notes: view.notes,
-      exerciseIds: view.exerciseIds,
-      status: view.status,
-    }),
-  );
-  return view;
+  const id = await localTransaction(database, async (tx) => {
+    const current = input.id
+      ? await tx.getFirstAsync<EquipmentRow>(
+          `SELECT * FROM equipment WHERE id = ? AND gym_id = ?`,
+          input.id,
+          gymId,
+        )
+      : null;
+    const view = equipmentFromWrite(current, gymId, input);
+    await saveCatalogRevision(tx, 'equipment', view);
+    return view.id;
+  });
+  if (online) await syncCatalog(userId);
+  return (await readLocalEquipment(userId, id))!;
 }
 
 export async function archiveEquipment(
@@ -256,51 +180,16 @@ export async function archiveEquipment(
   online: boolean,
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
-  const current = await database.getFirstAsync<EquipmentRow>(
-    `SELECT * FROM equipment WHERE id = ? AND gym_id = ?`,
-    equipmentId,
-    gymId,
-  );
-  if (!current) {
-    return;
-  }
-  if (!current.synced) {
-    await database.runAsync(
-      `DELETE FROM sync_queue WHERE entity_id = ? AND status = 'pending'`,
+  await localTransaction(database, async (tx) => {
+    const current = await tx.getFirstAsync<EquipmentRow>(
+      `SELECT * FROM equipment WHERE id = ? AND gym_id = ?`,
       equipmentId,
+      gymId,
     );
-    await database.runAsync(`DELETE FROM equipment WHERE id = ?`, equipmentId);
-    return;
-  }
-  if (online) {
-    try {
-      const saved = await archiveEquipmentRequest(gymId, equipmentId);
-      await writeEquipment(database, saved, 0, 1, current);
-      return;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
-  const view = { ...mapEquipment(current), status: 'archived' as const };
-  await writeEquipment(database, view, 1, 1, current);
-  await enqueue(
-    database,
-    'equipment',
-    equipmentId,
-    syncBaseVersion(current.version),
-    equipmentSyncPayloadSchema.parse({
-      id: view.id,
-      gymId: view.gymId,
-      name: view.name,
-      machineNumber: view.machineNumber,
-      nickname: view.nickname,
-      notes: view.notes,
-      exerciseIds: view.exerciseIds,
-      status: 'archived',
-    }),
-  );
+    if (current)
+      await saveCatalogRevision(tx, 'equipment', { ...mapEquipment(current), status: 'archived' });
+  });
+  if (online) await syncCatalog(userId);
 }
 
 export async function saveEquipmentPhoto(
@@ -438,46 +327,18 @@ export async function saveExercise(
   online: boolean,
 ): Promise<ExerciseView> {
   const database = await openLocalDatabase(userId);
-  const current = input.id
-    ? await database.getFirstAsync<ExerciseRow>(`SELECT * FROM exercises WHERE id = ?`, input.id)
-    : null;
-  if (current && !current.editable) {
-    throw new Error('Exercícios da biblioteca geral não podem ser editados.');
-  }
-  if (online) {
-    try {
-      const saved = current
-        ? await updateExerciseRequest(current.id, input)
-        : await createExerciseRequest(input);
-      await writeExercise(database, saved, 0, 1);
-      return saved;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
-  const view = exerciseFromWrite(current, input);
-  await writeExercise(database, view, 1, current?.synced ?? 0);
-  await enqueue(
-    database,
-    'exercise',
-    view.id,
-    current?.synced ? syncBaseVersion(current.version) : null,
-    exerciseSyncPayloadSchema.parse({
-      id: view.id,
-      namePt: view.namePt,
-      alternativeName: view.alternativeName,
-      activityType: view.activityType,
-      description: view.description,
-      instructions: view.instructions,
-      primaryMuscle: view.primaryMuscle,
-      secondaryMuscles: view.secondaryMuscles,
-      equipmentTypes: view.equipmentTypes,
-      status: view.status,
-    }),
-  );
-  return view;
+  const id = await localTransaction(database, async (tx) => {
+    const current = input.id
+      ? await tx.getFirstAsync<ExerciseRow>(`SELECT * FROM exercises WHERE id = ?`, input.id)
+      : null;
+    if (current && !current.editable)
+      throw new Error('Exercícios da biblioteca geral não podem ser editados.');
+    const view = exerciseFromWrite(current, input);
+    await saveCatalogRevision(tx, 'exercise', view);
+    return view.id;
+  });
+  if (online) await syncCatalog(userId);
+  return (await readLocalExercise(userId, id))!;
 }
 
 export async function archiveExercise(
@@ -486,52 +347,16 @@ export async function archiveExercise(
   online: boolean,
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
-  const current = await database.getFirstAsync<ExerciseRow>(
-    `SELECT * FROM exercises WHERE id = ?`,
-    exerciseId,
-  );
-  if (!current || !current.editable) {
-    throw new Error('Exercícios da biblioteca geral não podem ser arquivados.');
-  }
-  if (!current.synced) {
-    await database.runAsync(
-      `DELETE FROM sync_queue WHERE entity_id = ? AND status = 'pending'`,
+  await localTransaction(database, async (tx) => {
+    const current = await tx.getFirstAsync<ExerciseRow>(
+      `SELECT * FROM exercises WHERE id = ?`,
       exerciseId,
     );
-    await database.runAsync(`DELETE FROM exercises WHERE id = ?`, exerciseId);
-    return;
-  }
-  if (online) {
-    try {
-      const saved = await archiveExerciseRequest(exerciseId);
-      await writeExercise(database, saved, 0, 1);
-      return;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
-  const view = { ...mapExercise(current), status: 'archived' as const };
-  await writeExercise(database, view, 1, 1);
-  await enqueue(
-    database,
-    'exercise',
-    exerciseId,
-    syncBaseVersion(current.version),
-    exerciseSyncPayloadSchema.parse({
-      id: view.id,
-      namePt: view.namePt,
-      alternativeName: view.alternativeName,
-      activityType: view.activityType,
-      description: view.description,
-      instructions: view.instructions,
-      primaryMuscle: view.primaryMuscle ?? 'other',
-      secondaryMuscles: view.secondaryMuscles,
-      equipmentTypes: view.equipmentTypes,
-      status: 'archived',
-    }),
-  );
+    if (!current || !current.editable)
+      throw new Error('Exercícios da biblioteca geral não podem ser arquivados.');
+    await saveCatalogRevision(tx, 'exercise', { ...mapExercise(current), status: 'archived' });
+  });
+  if (online) await syncCatalog(userId);
 }
 
 export async function localEntityError(userId: string, entityId: string): Promise<string | null> {
@@ -557,131 +382,179 @@ export async function discardLocalChange(userId: string, entityId: string): Prom
   await database.runAsync(`UPDATE exercises SET pending = 0 WHERE id = ?`, entityId);
 }
 
-export async function syncCatalog(userId: string): Promise<SyncReport> {
+export function syncCatalog(userId: string): Promise<SyncReport> {
+  return singleSync(userId, 'catalog', () => runCatalogSync(userId));
+}
+
+const catalogTypes: ('gym' | 'equipment' | 'exercise')[] = ['gym', 'equipment', 'exercise'];
+async function runCatalogSync(userId: string): Promise<SyncReport> {
   const database = await openLocalDatabase(userId);
-  const queued = await database.getAllAsync<QueueRow>(
-    `SELECT * FROM sync_queue WHERE status = 'pending' AND entity_type IN ('gym', 'equipment', 'exercise') ORDER BY created_at ASC LIMIT 20`,
-  );
+  // Repair legacy dirty rows whose latest revision has no operation yet.
+  await localTransaction(database, async (tx) => {
+    for (const type of catalogTypes) {
+      const rows = await tx.getAllAsync<{ id: string; local_revision: number }>(
+        `SELECT id, local_revision FROM ${syncTable(type)} WHERE pending = 1`,
+      );
+      for (const row of rows) {
+        const queued = await tx.getFirstAsync(
+          `SELECT id FROM sync_queue WHERE entity_type = ? AND entity_id = ? AND local_revision = ? AND status IN ('pending','in_flight','error')`,
+          type,
+          row.id,
+          row.local_revision,
+        );
+        if (!queued) {
+          const view = await catalogView(tx, type, row.id);
+          if (view)
+            await enqueue(
+              tx,
+              type,
+              row.id,
+              (await revision(tx, type, row.id))!.version || null,
+              catalogPayload(type, view),
+              row.local_revision,
+            );
+        }
+      }
+    }
+  });
+  const queued = await claimOperations(database, catalogTypes);
   let conflicts = 0;
-  if (queued.length > 0) {
-    const ids = queued.map((row) => row.id);
-    await database.runAsync(
-      `UPDATE sync_queue SET status = 'in_flight', updated_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
-      new Date().toISOString(),
-      ...ids,
-    );
-    try {
+  try {
+    if (queued.length) {
       const result = await pushCatalogSync(queued.map(toOperation));
       for (const item of result.results) {
         const row = queued.find((candidate) => candidate.id === item.id);
-        if (!row) {
-          continue;
-        }
-        if (item.status === 'applied') {
-          await database.runAsync(
-            `UPDATE sync_queue SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`,
-            new Date().toISOString(),
-            item.id,
-          );
-          await markSynced(database, row.entity_type, row.entity_id);
-        } else {
+        if (!row) continue;
+        if (item.status === 'applied') await acknowledge(database, row);
+        else {
           conflicts += item.status === 'conflict' ? 1 : 0;
-          await database.runAsync(
-            `UPDATE sync_queue SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`,
-            item.code ?? item.status,
-            new Date().toISOString(),
-            item.id,
-          );
+          await localTransaction(database, async (tx) => {
+            await tx.runAsync(
+              `UPDATE sync_queue SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`,
+              item.code ?? item.status,
+              new Date().toISOString(),
+              item.id,
+            );
+          });
         }
       }
-    } catch (error) {
-      await database.runAsync(
-        `UPDATE sync_queue SET status = 'pending', updated_at = ? WHERE status = 'in_flight'`,
-        new Date().toISOString(),
-      );
-      if (isNetworkError(error)) {
-        return { synced: false, conflicts: 0 };
-      }
-      throw error;
     }
-  }
-  try {
+    await releaseOperations(database, queued);
     await refreshSnapshot(database);
     await flushPhotos(database);
   } catch (error) {
-    if (isNetworkError(error)) {
-      return { synced: false, conflicts };
-    }
+    await releaseOperations(database, queued);
+    if (isNetworkError(error)) return { synced: false, conflicts };
     throw error;
   }
-  return { synced: true, conflicts };
+  const photos = await database.getFirstAsync(
+    `SELECT id FROM equipment WHERE photo_pending <> 0 LIMIT 1`,
+  );
+  return { synced: !photos && !(await hasPending(database, catalogTypes)), conflicts };
 }
 
 async function refreshSnapshot(database: Database): Promise<void> {
-  const snapshot = await pullCatalogSnapshot();
-  await mergeTable(
-    database,
-    'gyms',
-    snapshot.gyms.map((gym) => gym.id),
-  );
-  for (const gym of snapshot.gyms) {
-    const pending = await database.getFirstAsync<{ pending: number }>(
-      `SELECT pending FROM gyms WHERE id = ?`,
-      gym.id,
-    );
-    if (!pending?.pending) {
-      await writeGym(database, gym, 0, 1);
-    }
-  }
-  await mergeTable(
-    database,
-    'equipment',
-    snapshot.equipment.map((item) => item.id),
-  );
-  for (const equipment of snapshot.equipment) {
-    const pending = await database.getFirstAsync<EquipmentRow>(
-      `SELECT * FROM equipment WHERE id = ?`,
-      equipment.id,
-    );
-    if (!pending?.pending) {
-      await writeEquipment(database, equipment, 0, 1, pending);
-    }
-  }
-  await mergeTable(
-    database,
-    'exercises',
-    snapshot.exercises.map((item) => item.id),
-  );
-  for (const exercise of snapshot.exercises) {
-    const pending = await database.getFirstAsync<{ pending: number }>(
-      `SELECT pending FROM exercises WHERE id = ?`,
-      exercise.id,
-    );
-    if (!pending?.pending) {
-      await writeExercise(database, exercise, 0, 1);
-    }
-  }
-}
-
-async function mergeTable(
-  database: Database,
-  table: 'gyms' | 'equipment' | 'exercises',
-  remoteIds: string[],
-): Promise<void> {
-  const local = await database.getAllAsync<{ id: string; pending: number }>(
-    `SELECT id, pending FROM ${table}`,
-  );
-  const keep = new Set(
-    retainedLocalIds(
-      local.map((row) => ({ id: row.id, pending: row.pending === 1 })),
-      remoteIds,
+  const captured = new Map(
+    await Promise.all(
+      catalogTypes.map(async (type) => [type, await captureRevisions(database, type)] as const),
     ),
   );
-  for (const row of local) {
-    if (!keep.has(row.id)) {
-      await database.runAsync(`DELETE FROM ${table} WHERE id = ?`, row.id);
+  const snapshot = await pullCatalogSnapshot();
+  await localTransaction(database, async (tx) => {
+    for (const type of catalogTypes) {
+      const rows = snapshot[syncTable(type) as 'gyms' | 'equipment' | 'exercises'];
+      const ids = new Set(rows.map((row) => row.id));
+      const before = captured.get(type)!;
+      for (const [id, state] of before) {
+        if (
+          !ids.has(id) &&
+          (await canApplyRemote(tx, type, id, state.local_revision, state.version))
+        ) {
+          // Deletion is conditional on BOTH local and remote versions captured before the GET.
+          await tx.runAsync(
+            `DELETE FROM ${syncTable(type)} WHERE id = ? AND local_revision = ? AND version = ? AND pending = 0`,
+            id,
+            state.local_revision,
+            state.version,
+          );
+        }
+      }
+      for (const row of rows) {
+        if (
+          await canApplyRemote(
+            tx,
+            type,
+            row.id,
+            before.get(row.id)?.local_revision ?? 0,
+            row.version,
+          )
+        ) {
+          if (type === 'gym') await writeGym(tx, row as GymView, 0, 1);
+          else if (type === 'equipment') {
+            const previous = await tx.getFirstAsync<EquipmentRow>(
+              `SELECT * FROM equipment WHERE id = ?`,
+              row.id,
+            );
+            await writeEquipment(tx, row as EquipmentView, 0, 1, previous);
+          } else await writeExercise(tx, row as ExerciseView, 0, 1);
+        }
+      }
     }
+  });
+}
+
+async function catalogView(
+  db: Database,
+  type: 'gym' | 'equipment' | 'exercise',
+  id: string,
+): Promise<GymView | EquipmentView | ExerciseView | null> {
+  if (type === 'gym') {
+    const row = await db.getFirstAsync<GymRow>(`SELECT * FROM gyms WHERE id = ?`, id);
+    return row ? mapGym(row) : null;
   }
+  if (type === 'equipment') {
+    const row = await db.getFirstAsync<EquipmentRow>(`SELECT * FROM equipment WHERE id = ?`, id);
+    return row ? mapEquipment(row) : null;
+  }
+  const row = await db.getFirstAsync<ExerciseRow>(`SELECT * FROM exercises WHERE id = ?`, id);
+  return row ? mapExercise(row) : null;
+}
+
+function catalogPayload(
+  type: 'gym' | 'equipment' | 'exercise',
+  view: GymView | EquipmentView | ExerciseView,
+): unknown {
+  return type === 'gym'
+    ? gymSyncPayloadSchema.parse(view)
+    : type === 'equipment'
+      ? equipmentSyncPayloadSchema.parse(view)
+      : exerciseSyncPayloadSchema.parse(view);
+}
+
+async function saveCatalogRevision(
+  db: Database,
+  type: 'gym' | 'equipment' | 'exercise',
+  view: GymView | EquipmentView | ExerciseView,
+): Promise<void> {
+  const current = await revision(db, type, view.id);
+  const next = (current?.local_revision ?? 0) + 1;
+  if (type === 'gym') await writeGym(db, view as GymView, 1, 0);
+  else if (type === 'equipment')
+    await writeEquipment(
+      db,
+      view as EquipmentView,
+      1,
+      0,
+      await db.getFirstAsync<EquipmentRow>(`SELECT * FROM equipment WHERE id = ?`, view.id),
+    );
+  else await writeExercise(db, view as ExerciseView, 1, 0);
+  await db.runAsync(
+    `UPDATE ${syncTable(type)} SET local_revision = ?, version = ? WHERE id = ?`,
+    next,
+    current?.version ?? 0,
+    view.id,
+  );
+  await enqueue(db, type, view.id, current?.version || null, catalogPayload(type, view), next);
 }
 
 async function flushPhotos(database: Database): Promise<void> {
@@ -716,6 +589,7 @@ async function enqueue(
   entityId: string,
   baseVersion: number | null,
   payload: unknown,
+  localRevision: number,
 ): Promise<void> {
   const plain = JSON.parse(JSON.stringify(payload)) as unknown;
   const payloadHash = await Crypto.digestStringAsync(
@@ -724,13 +598,9 @@ async function enqueue(
   );
   const now = new Date().toISOString();
   await database.runAsync(
-    `DELETE FROM sync_queue WHERE entity_id = ? AND status = 'pending'`,
-    entityId,
-  );
-  await database.runAsync(
     `INSERT INTO sync_queue (
-      id, entity_type, entity_id, operation, idempotency_key, payload_hash, payload, base_version, status, created_at, updated_at
-    ) VALUES (?, ?, ?, 'upsert', ?, ?, ?, ?, 'pending', ?, ?)`,
+      id, entity_type, entity_id, operation, idempotency_key, payload_hash, payload, base_version, status, created_at, updated_at, local_revision
+    ) VALUES (?, ?, ?, 'upsert', ?, ?, ?, ?, 'pending', ?, ?, ?)`,
     Crypto.randomUUID(),
     entityType,
     entityId,
@@ -740,10 +610,11 @@ async function enqueue(
     baseVersion,
     now,
     now,
+    localRevision,
   );
 }
 
-function toOperation(row: QueueRow) {
+function toOperation(row: QueuedRevision) {
   return {
     id: row.id,
     entityType: row.entity_type,
@@ -755,12 +626,6 @@ function toOperation(row: QueueRow) {
     createdAt: row.created_at,
     payload: JSON.parse(row.payload) as unknown,
   };
-}
-
-async function markSynced(database: Database, entityType: string, entityId: string): Promise<void> {
-  const table =
-    entityType === 'gym' ? 'gyms' : entityType === 'equipment' ? 'equipment' : 'exercises';
-  await database.runAsync(`UPDATE ${table} SET pending = 0, synced = 1 WHERE id = ?`, entityId);
 }
 
 async function writeGym(
@@ -1043,16 +908,4 @@ type ExerciseRow = {
   version: number;
   pending: number;
   synced: number;
-};
-
-type QueueRow = {
-  id: string;
-  entity_type: 'gym' | 'equipment' | 'exercise';
-  entity_id: string;
-  operation: 'upsert';
-  idempotency_key: string;
-  payload_hash: string;
-  payload: string;
-  base_version: number | null;
-  created_at: string;
 };
