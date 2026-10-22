@@ -5,7 +5,7 @@ import {
 } from '@meutreino/shared';
 import * as SQLite from 'expo-sqlite';
 
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 
 export type LocalDatabaseStatus = {
   ready: true;
@@ -36,6 +36,25 @@ async function initialize(userId: string): Promise<SQLite.SQLiteDatabase> {
   await database.execAsync('PRAGMA journal_mode = WAL;');
   await database.execAsync('PRAGMA foreign_keys = ON;');
   await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS local_plan_reconciliations (
+      id TEXT PRIMARY KEY NOT NULL, plan_id TEXT NOT NULL, conflict_id TEXT NOT NULL,
+      request TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS local_plan_reconciliation_pending ON local_plan_reconciliations(plan_id) WHERE result IS NULL;
+    CREATE TABLE IF NOT EXISTS local_plan_derivations (
+      origin_id TEXT PRIMARY KEY NOT NULL, source_origin_id TEXT NOT NULL,
+      decision_id TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS local_plan_derivation_immutable BEFORE UPDATE ON local_plan_derivations
+      BEGIN SELECT RAISE(ABORT,'derivation is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS local_plan_derivation_no_delete BEFORE DELETE ON local_plan_derivations
+      BEGIN SELECT RAISE(ABORT,'derivation is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS local_plan_reconciliation_request_immutable BEFORE UPDATE OF id,plan_id,conflict_id,request,created_at ON local_plan_reconciliations
+      BEGIN SELECT RAISE(ABORT,'decision is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS local_plan_reconciliation_result_immutable BEFORE UPDATE OF result ON local_plan_reconciliations WHEN OLD.result IS NOT NULL
+      BEGIN SELECT RAISE(ABORT,'receipt is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS local_plan_reconciliation_no_delete BEFORE DELETE ON local_plan_reconciliations
+      BEGIN SELECT RAISE(ABORT,'decision is immutable'); END;
     CREATE TABLE IF NOT EXISTS plan_conflict_intents (
       plan_id TEXT PRIMARY KEY NOT NULL, conflict_id TEXT NOT NULL,
       choice TEXT NOT NULL CHECK(choice IN ('keep_server','keep_local','keep_both')),

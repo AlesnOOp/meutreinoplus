@@ -15,6 +15,7 @@ import {
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import {
   planConflictResolveSchema,
+  planReconcileRequestSchema,
   planCreateSchema,
   planExerciseReplaceSchema,
   planExerciseSchema,
@@ -364,6 +365,22 @@ export class WorkoutPlanConflictController {
   @ApiOperation({ summary: 'Lista conflitos de ficha aguardando revisão.' })
   list(@Req() request: AuthenticatedRequest) {
     return this.plans.listConflicts(requireAuth(request).userId);
+  }
+
+  @Post(':conflictId/reconcile')
+  @HttpCode(200)
+  reconcile(
+    @Req() request: AuthenticatedRequest,
+    @Param('conflictId', new ZodValidationPipe(uuidSchema)) conflictId: string,
+    @Body(new ZodValidationPipe(planReconcileRequestSchema))
+    body: z.infer<typeof planReconcileRequestSchema>,
+  ) {
+    return this.plans.reconcileConflict(
+      requireAuth(request).userId,
+      conflictId,
+      body,
+      requireAuth(request).sessionId,
+    );
   }
 
   @Post(':conflictId/resolve')

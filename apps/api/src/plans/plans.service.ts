@@ -4,6 +4,10 @@ import {
   loadExceedsLimit,
   planSyncMutationSchema,
   canonicalPlanContent,
+  canonicalJsonString,
+  planReconcileResultSchema,
+  type PlanReconcileRequest,
+  type PlanReconcileResult,
   planSyncPayloadSchema,
   toCanonicalKilograms,
   type PlanExerciseInput,
@@ -13,6 +17,7 @@ import {
 } from '@meutreino/shared';
 import { Prisma } from '../generated/prisma/client';
 import { SecurityAuditService } from '../identity/audit.service';
+import { sha256 } from '../identity/crypto';
 import { fail } from '../identity/http';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -612,6 +617,282 @@ export class PlansService {
       preservedPlan: result.preserved ? presentPlan(result.preserved) : null,
       ...(await this.originResult(existing.id)),
     };
+  }
+
+  async reconcileConflict(
+    userId: string,
+    conflictId: string,
+    input: PlanReconcileRequest,
+    authSessionId: string,
+  ) {
+    const auth = await this.prisma.authSession.findFirst({
+      where: { id: authSessionId, userId, revokedAt: null },
+    });
+    if (!auth?.deviceId) throw fail(HttpStatus.UNAUTHORIZED, 'unauthenticated', 'Entre novamente.');
+    const requestHash = sha256(canonicalJsonString(input));
+    const conflict = await this.prisma.workoutPlanConflict.findFirst({
+      where: { id: conflictId, userId },
+    });
+    if (!conflict) throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Conflito não encontrado.');
+    return this.prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan:${conflict.planId}`},0))`;
+        await tx.$queryRaw`SELECT id FROM meutreino.workout_plans WHERE id=${conflict.planId}::uuid AND owner_user_id=${userId}::uuid FOR UPDATE`;
+        const previous = await tx.planReconciliation.findUnique({ where: { id: input.id } });
+        if (previous) {
+          if (
+            previous.userId !== userId ||
+            previous.conflictId !== conflictId ||
+            previous.requestHash !== requestHash
+          )
+            throw fail(
+              HttpStatus.CONFLICT,
+              'decision_reused',
+              'A decisão já possui outro conteúdo.',
+            );
+          return planReconcileResultSchema.parse(previous.result);
+        }
+        await tx.$queryRaw`SELECT id FROM meutreino.workout_plan_conflicts WHERE id=${conflictId}::uuid FOR UPDATE`;
+        const claimed = await tx.workoutPlanConflict.findUniqueOrThrow({
+          where: { id: conflictId },
+        });
+        if (claimed.status !== 'open')
+          throw fail(
+            HttpStatus.CONFLICT,
+            'conflict_resolved',
+            'Outro aparelho já resolveu este conflito. Atualize a ficha; o conteúdo local continua preservado.',
+          );
+        const current = await this.ownedTx(tx, userId, conflict.planId);
+        if (current.version !== input.expectedVersion)
+          throw fail(
+            HttpStatus.CONFLICT,
+            'reconciliation_stale',
+            'A ficha mudou novamente. Atualize a prévia antes de decidir.',
+          );
+        const root = planSyncMutationSchema.parse(claimed.payload);
+        if (!root.revisionOrigin)
+          throw fail(
+            HttpStatus.CONFLICT,
+            'unsupported_legacy',
+            'A origem legada exige recuperação assistida.',
+          );
+        const rootOp = input.operations.find((op) => op.id === conflictId);
+        if (!rootOp || canonicalJsonString(rootOp.payload) !== canonicalJsonString(root))
+          throw fail(
+            HttpStatus.BAD_REQUEST,
+            'invalid_reconciliation',
+            'A operação original não confere.',
+          );
+        const ids = new Set<string>(),
+          keys = new Set<string>(),
+          origins = new Set<string>();
+        const pending = [...input.operations];
+        while (pending.length) {
+          const index = pending.findIndex(
+            (op) =>
+              op.id === conflictId ||
+              (op.payload.revisionOrigin?.parentId &&
+                origins.has(op.payload.revisionOrigin.parentId)),
+          );
+          if (index < 0)
+            throw fail(
+              HttpStatus.BAD_REQUEST,
+              'invalid_reconciliation',
+              'A cadeia de dependências não confere.',
+            );
+          const op = pending.splice(index, 1)[0]!;
+          const origin = op.payload.revisionOrigin;
+          if (
+            !origin ||
+            op.entityId !== current.id ||
+            op.payload.id !== current.id ||
+            ids.has(op.id) ||
+            keys.has(op.idempotencyKey) ||
+            origins.has(origin.id) ||
+            sha256(canonicalJsonString(op.payload)) !== op.payloadHash
+          )
+            throw fail(
+              HttpStatus.BAD_REQUEST,
+              'invalid_reconciliation',
+              'Identidade ou conteúdo da operação inválido.',
+            );
+          ids.add(op.id);
+          keys.add(op.idempotencyKey);
+          origins.add(origin.id);
+          const receipt = await tx.syncOperation.findFirst({
+            where: { OR: [{ id: op.id }, { idempotencyKey: op.idempotencyKey }] },
+          });
+          if (
+            receipt &&
+            (receipt.id !== op.id ||
+              receipt.userId !== userId ||
+              receipt.entityId !== current.id ||
+              receipt.entityType !== 'workout_plan' ||
+              receipt.operation !== op.operation ||
+              receipt.idempotencyKey !== op.idempotencyKey ||
+              receipt.payloadHash !== op.payloadHash ||
+              receipt.baseVersion !== op.baseVersion)
+          )
+            throw fail(
+              HttpStatus.CONFLICT,
+              'operation_reused',
+              'A identidade da operação já possui outro conteúdo.',
+            );
+          const closure = await tx.planOperationClosure.findFirst({
+            where: { OR: [{ operationId: op.id }, { idempotencyKey: op.idempotencyKey }] },
+          });
+          if (closure)
+            throw fail(
+              HttpStatus.CONFLICT,
+              'operation_closed',
+              'Uma operação já pertence a outra decisão.',
+            );
+        }
+        const source = input.sourceOriginId
+          ? input.operations.find((op) => op.payload.revisionOrigin!.id === input.sourceOriginId)
+          : null;
+        if (input.descendants === 'reapply' && (!source || source.id === conflictId))
+          throw fail(
+            HttpStatus.BAD_REQUEST,
+            'invalid_reconciliation',
+            'Selecione explicitamente uma edição posterior para reaplicar.',
+          );
+        if (input.descendants === 'archive' && input.sourceOriginId !== null)
+          throw fail(
+            HttpStatus.BAD_REQUEST,
+            'invalid_reconciliation',
+            'Arquivar não reaplica uma edição.',
+          );
+        let preservedPlan: PlanView | null = null;
+        if (input.choice === 'keep_both') {
+          const copy = planSyncPayloadSchema.parse({
+            ...root,
+            id: randomUUID(),
+            name: copyName(root.name),
+            status: 'active',
+            exercises: cloneExercises(root.exercises),
+          });
+          await this.insertPlan(tx, userId, copy, 1);
+          await tx.workoutPlan.update({
+            where: { id: copy.id },
+            data: { duplicatedFromId: current.id },
+          });
+          await this.persistTree(tx, userId, copy.id, copy.exercises);
+          await this.revise(tx, copy.id);
+          preservedPlan = presentPlan(await this.ownedTx(tx, userId, copy.id));
+        }
+        let derived: PlanReconcileResult['derived'] = null;
+        if (input.descendants === 'reapply' && source) {
+          const target = preservedPlan ?? presentPlan(current);
+          const originId = randomUUID();
+          const payload = planSyncMutationSchema.parse({
+            ...source.payload,
+            id: target.id,
+            exercises: preservedPlan
+              ? cloneExercises(source.payload.exercises)
+              : source.payload.exercises,
+            revisionOrigin: { id: originId, parentId: null },
+          });
+          const operation = {
+            id: randomUUID(),
+            entityType: 'workout_plan' as const,
+            entityId: target.id,
+            operation: 'upsert' as const,
+            idempotencyKey: `reconciliation:${input.id}:derived`,
+            payloadHash: sha256(canonicalJsonString(payload)),
+            baseVersion: target.version,
+            createdAt: new Date().toISOString(),
+            payload,
+          };
+          await this.applySynced(tx, userId, 'upsert', payload, target.version);
+          const snapshot = presentPlan(await this.ownedTx(tx, userId, target.id));
+          await tx.syncOperation.create({
+            data: {
+              id: operation.id,
+              userId,
+              deviceId: auth.deviceId!,
+              entityType: 'workout_plan',
+              entityId: target.id,
+              operation: 'upsert',
+              idempotencyKey: operation.idempotencyKey,
+              payloadHash: operation.payloadHash,
+              baseVersion: operation.baseVersion,
+              status: 'applied',
+              appliedAt: new Date(),
+            },
+          });
+          await tx.planRevisionOrigin.create({
+            data: {
+              id: originId,
+              planId: target.id,
+              userId,
+              version: snapshot.version,
+              operationId: operation.id,
+              requestHash: operation.payloadHash,
+              snapshot: jsonValue(snapshot),
+            },
+          });
+          derived = {
+            sourceOriginId: input.sourceOriginId!,
+            operation,
+            revision: { originId, version: snapshot.version, snapshot },
+          };
+          if (preservedPlan) preservedPlan = snapshot;
+        }
+        const closed: PlanReconcileResult['closed'] = [];
+        for (const op of input.operations) {
+          const receipt = await tx.syncOperation.findUnique({
+            where: { idempotencyKey: op.idempotencyKey },
+          });
+          closed.push({
+            id: op.id,
+            status: receipt?.status === 'applied' ? 'applied' : 'closed',
+            originId: op.payload.revisionOrigin!.id,
+          });
+        }
+        const result = planReconcileResultSchema.parse({
+          id: input.id,
+          choice: input.choice,
+          plan: presentPlan(await this.ownedTx(tx, userId, current.id)),
+          preservedPlan,
+          closed,
+          derived,
+        });
+        await tx.planReconciliation.create({
+          data: {
+            id: input.id,
+            userId,
+            planId: current.id,
+            conflictId,
+            requestHash,
+            request: jsonValue(input),
+            result: jsonValue(result),
+          },
+        });
+        for (const op of input.operations)
+          await tx.planOperationClosure.create({
+            data: {
+              idempotencyKey: op.idempotencyKey,
+              operationId: op.id,
+              userId,
+              planId: current.id,
+              decisionId: input.id,
+              payloadHash: op.payloadHash,
+              baseVersion: op.baseVersion,
+            },
+          });
+        await tx.workoutPlanConflict.update({
+          where: { id: conflictId },
+          data: {
+            status: input.choice,
+            preservedPlanId: preservedPlan?.id ?? null,
+            resolvedAt: new Date(),
+          },
+        });
+        return result;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 20000 },
+    );
   }
 
   private async originResult(operationId: string) {

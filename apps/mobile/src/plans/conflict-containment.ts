@@ -21,6 +21,14 @@ export async function readPlanConflictIntent(db: SQLiteDatabase, planId: string)
 }
 /** Must run in the same exclusive transaction as the edit or new session. */
 export async function assertPlanCanGainDependencies(db: SQLiteDatabase, planId: string) {
+  const reconciliation = await db.getFirstAsync<{ id: string }>(
+    'SELECT id FROM local_plan_reconciliations WHERE plan_id=? AND result IS NULL',
+    planId,
+  );
+  if (reconciliation)
+    throw new Error(
+      'Uma reconciliação aguarda confirmação. Reabra o conflito e retome a mesma decisão antes de editar ou iniciar treino.',
+    );
   const intent = await readPlanConflictIntent(db, planId);
   if (intent && intent.choice !== 'keep_local')
     throw new Error(
@@ -55,6 +63,13 @@ export async function inspectPlanConflictDependencies(
     status: string;
     attempt_count: number;
     payload: string;
+    entity_id: string;
+    operation: string;
+    idempotency_key: string;
+    payload_hash: string;
+    base_version: number | null;
+    created_at: string;
+    local_revision: number;
   }>("SELECT * FROM sync_queue WHERE entity_type='workout_plan' AND entity_id=?", planId);
   const sessions = await db.getAllAsync<{
     id: string;

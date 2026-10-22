@@ -1,3 +1,4 @@
+import { getPlanRequest } from '@/api/plans';
 import { resolutionLabel } from './conflict-containment';
 import { planColors } from '@/theme/colors';
 import {
@@ -40,6 +41,7 @@ import {
   listLocalPlans,
   readLocalPlan,
   resolveLocalConflict,
+  reconcileLocalPlanConflict,
   syncPlans,
   updateLocalPlan,
   type LocalPlan,
@@ -317,6 +319,47 @@ export function PlanDetailScreen() {
       {plan.conflictOperationId ? (
         <ConflictActions
           online={online}
+          legacyPendingChoice={plan.resolutionPendingChoice}
+          reconciliationPending={plan.reconciliationPending}
+          onReconcile={async (choice, descendants) => {
+            if (!online) throw new Error('Conecte-se para confirmar a decisão. Nada foi apagado.');
+            const submit = async (expectedVersion?: number) => {
+              await reconcileLocalPlanConflict(
+                account.id,
+                plan.id,
+                choice,
+                descendants,
+                descendants === 'reapply' ? (plan.originRevisionId ?? null) : null,
+                expectedVersion,
+                Boolean(plan.reconciliationPending),
+                plan.originRevisionId ?? undefined,
+              );
+            };
+            try {
+              if (plan.reconciliationPending) await submit();
+              else {
+                const remote = await getPlanRequest(plan.id);
+                await new Promise<void>((resolve, reject) =>
+                  Alert.alert(
+                    'Confirmar reconciliação',
+                    `Servidor: ${remote.name} (revisão ${remote.version}). Edição local exibida: ${plan.name}. ${choice === 'keep_both' ? 'Será criada uma ficha independente para a versão em conflito. ' : ''}${descendants === 'archive' ? 'As edições posteriores serão arquivadas sem apagar o conteúdo.' : 'A última edição local será reaplicada como uma nova revisão ' + (choice === 'keep_both' ? 'na cópia.' : 'sobre a versão do servidor.')}`,
+                    [
+                      { text: 'Cancelar', style: 'cancel', onPress: () => resolve() },
+                      {
+                        text: 'Confirmar',
+                        onPress: () => {
+                          void submit(remote.version).then(resolve, reject);
+                        },
+                      },
+                    ],
+                    { cancelable: true, onDismiss: () => resolve() },
+                  ),
+                );
+              }
+            } finally {
+              await reload();
+            }
+          }}
           onChoice={async (choice) => {
             if (!online) {
               setError(
@@ -923,23 +966,30 @@ export function EquipmentPickerScreen() {
 function ConflictActions({
   online,
   onChoice,
+  onReconcile,
+  legacyPendingChoice,
+  reconciliationPending,
 }: {
   online: boolean;
   onChoice: (choice: 'keep_server' | 'keep_local' | 'keep_both') => Promise<void>;
+  onReconcile: (
+    choice: 'keep_server' | 'keep_both',
+    descendants: 'archive' | 'reapply',
+  ) => Promise<void>;
+  legacyPendingChoice?: 'keep_server' | 'keep_local' | 'keep_both';
+  reconciliationPending?: boolean;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  async function choose(choice: 'keep_server' | 'keep_local' | 'keep_both') {
+  async function act(work: () => Promise<void>) {
     if (busy) return;
     setBusy(true);
     setError(null);
     try {
-      await onChoice(choice);
+      await work();
     } catch (cause) {
       setError(
-        cause instanceof Error
-          ? cause.message
-          : 'Não foi possível confirmar. Repita a mesma escolha.',
+        cause instanceof Error ? cause.message : 'Decisão não confirmada. Reabra a ficha e retome.',
       );
     } finally {
       setBusy(false);
@@ -948,27 +998,55 @@ function ConflictActions({
   return (
     <View style={{ gap: 8 }}>
       {error ? <Notice tone="error" message={error} /> : null}
-      <Notice message="Esta ficha mudou em outro lugar. As duas versões continuam disponíveis." />
-      {online ? null : (
-        <Notice message="Sem conexão, a revisão fica para depois. Nada é apagado neste aparelho." />
+      <Notice message="Esta ficha mudou em outro lugar. Arquivar preserva o conteúdo local no histórico. Reaplicar cria outra revisão com a última edição exibida nesta ficha, sem modificar sua origem." />
+      {!online ? (
+        <Notice message="Conecte-se para confirmar; as alterações continuam neste aparelho." />
+      ) : null}
+      {reconciliationPending ? (
+        <Button
+          label="Retomar reconciliação"
+          disabled={busy}
+          onPress={() => void act(() => onReconcile('keep_server', 'archive'))}
+        />
+      ) : legacyPendingChoice ? (
+        <Button
+          label={`Retomar: ${resolutionLabel(legacyPendingChoice)}`}
+          disabled={busy}
+          onPress={() => void act(() => onChoice(legacyPendingChoice))}
+        />
+      ) : (
+        <>
+          <Button
+            label="Manter a versão deste aparelho"
+            disabled={busy}
+            onPress={() => void act(() => onChoice('keep_local'))}
+          />
+          <Button
+            label="Manter servidor e arquivar edições locais"
+            variant="secondary"
+            disabled={busy}
+            onPress={() => void act(() => onReconcile('keep_server', 'archive'))}
+          />
+          <Button
+            label="Reaplicar última edição sobre a versão do servidor"
+            variant="secondary"
+            disabled={busy}
+            onPress={() => void act(() => onReconcile('keep_server', 'reapply'))}
+          />
+          <Button
+            label="Guardar duas fichas e arquivar edições posteriores"
+            variant="secondary"
+            disabled={busy}
+            onPress={() => void act(() => onReconcile('keep_both', 'archive'))}
+          />
+          <Button
+            label="Guardar duas fichas e reaplicar última edição na cópia"
+            variant="secondary"
+            disabled={busy}
+            onPress={() => void act(() => onReconcile('keep_both', 'reapply'))}
+          />
+        </>
       )}
-      <Button
-        label="Manter a versão deste aparelho"
-        disabled={busy}
-        onPress={() => void choose('keep_local')}
-      />
-      <Button
-        label="Manter a versão sincronizada"
-        variant="secondary"
-        disabled={busy}
-        onPress={() => void choose('keep_server')}
-      />
-      <Button
-        label="Guardar as duas fichas"
-        variant="secondary"
-        disabled={busy}
-        onPress={() => void choose('keep_both')}
-      />
     </View>
   );
 }

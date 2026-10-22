@@ -144,8 +144,8 @@ export class SyncApplyService {
         return await this.prisma.$transaction(
           async (tx) => {
             // Also serialize creation and retries when no row exists yet.
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan-key:${operation.idempotencyKey}`},0))`;
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan:${payload.id}`},0))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan-key:${operation.idempotencyKey}`},0))`;
             const current = await tx.workoutPlan.findUnique({ where: { id: payload.id } });
             if (current && current.ownerUserId !== userId)
               throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Ficha não encontrada.');
@@ -166,6 +166,13 @@ export class SyncApplyService {
                   status: 'rejected' as const,
                   code: 'idempotency_key_reused',
                 };
+              if (
+                receipt.status !== 'applied' &&
+                (await tx.planOperationClosure.findUnique({
+                  where: { idempotencyKey: operation.idempotencyKey },
+                }))
+              )
+                return { id: operation.id, status: 'rejected' as const, code: 'operation_closed' };
               const origin = await tx.planRevisionOrigin.findUnique({
                 where: { operationId: receipt.id },
               });
@@ -184,6 +191,25 @@ export class SyncApplyService {
                   : {}),
               };
             }
+            const closure = await tx.planOperationClosure.findFirst({
+              where: {
+                OR: [{ idempotencyKey: operation.idempotencyKey }, { operationId: operation.id }],
+              },
+            });
+            if (closure)
+              return {
+                id: operation.id,
+                status: 'rejected' as const,
+                code:
+                  closure.userId === userId &&
+                  closure.planId === payload.id &&
+                  closure.operationId === operation.id &&
+                  closure.idempotencyKey === operation.idempotencyKey &&
+                  closure.payloadHash === operation.payloadHash &&
+                  closure.baseVersion === operation.baseVersion
+                    ? 'operation_closed'
+                    : 'idempotency_key_reused',
+              };
             if (await tx.syncOperation.findUnique({ where: { id: operation.id } }))
               return {
                 id: operation.id,

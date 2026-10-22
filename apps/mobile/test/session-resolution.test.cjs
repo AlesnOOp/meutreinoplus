@@ -251,7 +251,7 @@ test('variants: remote and local historical copies persist across restart and do
   assert.equal((await h.db.getFirstAsync('SELECT COUNT(*) count FROM sessions')).count, 1);
 });
 
-test('SQLite schema 5→8 migration preserves synced catalog versions instead of repeating schema 4 normalization', async (t) => {
+test('SQLite schema 5→9 migration preserves synced catalog versions instead of repeating schema 4 normalization', async (t) => {
   const { h } = await prepare(t);
   await h.db.runAsync("UPDATE local_meta SET value='5' WHERE key='schema_version'");
   await h.db.runAsync('UPDATE gyms SET version=7,pending=0,synced=1 WHERE id=?', h.gym.id);
@@ -261,7 +261,7 @@ test('SQLite schema 5→8 migration preserves synced catalog versions instead of
   assert.equal(gym.synced, 1);
   assert.equal(
     (await h.db.getFirstAsync("SELECT value FROM local_meta WHERE key='schema_version'")).value,
-    '8',
+    '9',
   );
 });
 

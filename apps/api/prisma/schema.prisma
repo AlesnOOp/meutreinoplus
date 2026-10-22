@@ -390,6 +390,9 @@ model User {
   emailChanges        EmailChangeToken[]
   securityAuditEvents SecurityAuditEvent[]
 
+  planReconciliations PlanReconciliation[]
+  planOperationClosures PlanOperationClosure[]
+
   @@index([status])
   @@map("users")
   @@schema("meutreino")
@@ -688,6 +691,9 @@ model WorkoutPlan {
   slots          WeeklyScheduleSlot[]
   sessions       WorkoutSession[]
 
+  planReconciliations PlanReconciliation[]
+  planOperationClosures PlanOperationClosure[]
+
   @@index([ownerUserId, status])
   @@map("workout_plans")
   @@schema("meutreino")
@@ -784,6 +790,8 @@ model WorkoutPlanConflict {
 
   user User        @relation(fields: [userId], references: [id], onDelete: Restrict)
   plan WorkoutPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  reconciliation PlanReconciliation?
 
   @@index([userId, status])
   @@map("workout_plan_conflicts")
@@ -1306,5 +1314,41 @@ model PlanRevisionOrigin {
   @@unique([planId, version])
   @@index([userId])
   @@map("plan_revision_origins")
+  @@schema("meutreino")
+}
+
+model PlanReconciliation {
+  id          String                 @id @db.Uuid
+  userId      String                 @map("user_id") @db.Uuid
+  planId      String                 @map("plan_id") @db.Uuid
+  conflictId  String                 @unique @map("conflict_id") @db.Uuid
+  requestHash String                 @map("request_hash") @db.VarChar(64)
+  request     Json
+  result      Json
+  createdAt   DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  user        User                   @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  plan        WorkoutPlan            @relation(fields: [planId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  conflict    WorkoutPlanConflict    @relation(fields: [conflictId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  closures    PlanOperationClosure[]
+
+  @@index([userId])
+  @@map("plan_reconciliations")
+  @@schema("meutreino")
+}
+model PlanOperationClosure {
+  idempotencyKey String             @id @map("idempotency_key") @db.VarChar(200)
+  operationId    String             @unique @map("operation_id") @db.Uuid
+  userId         String             @map("user_id") @db.Uuid
+  planId         String             @map("plan_id") @db.Uuid
+  decisionId     String             @map("decision_id") @db.Uuid
+  payloadHash    String             @map("payload_hash") @db.VarChar(64)
+  baseVersion    Int?               @map("base_version")
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  user           User               @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  plan           WorkoutPlan        @relation(fields: [planId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  decision       PlanReconciliation @relation(fields: [decisionId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([userId])
+  @@map("plan_operation_closures")
   @@schema("meutreino")
 }

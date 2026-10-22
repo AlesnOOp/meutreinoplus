@@ -13,6 +13,8 @@ const APPEND_ONLY_TABLES = [
   'audit_logs',
   'workout_plan_revisions',
   'plan_revision_origins',
+  'plan_reconciliations',
+  'plan_operation_closures',
   'session_time_events',
   'workout_session_resolutions',
   'workout_session_variants',
@@ -92,6 +94,8 @@ export class DeletionService {
             data: { workoutPlanId: null },
           });
           await tx.weeklyScheduleSlot.deleteMany({ where: { workoutPlanId: { in: planIds } } });
+          await tx.planOperationClosure.deleteMany({ where: { userId } });
+          await tx.planReconciliation.deleteMany({ where: { userId } });
           await tx.workoutPlanConflict.deleteMany({
             where: { OR: [{ userId }, { planId: { in: planIds } }] },
           });

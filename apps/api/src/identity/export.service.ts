@@ -102,6 +102,8 @@ export class ExportService {
       this.prisma.userProfile.findUnique({ where: { userId }, include: { photo: true } }),
     ]);
     return {
+      planReconciliations: await this.prisma.planReconciliation.findMany({ where: { userId } }),
+      planOperationClosures: await this.prisma.planOperationClosure.findMany({ where: { userId } }),
       exportedAt: new Date().toISOString(),
       account,
       consents: consents.map((consent) => ({

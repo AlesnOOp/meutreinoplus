@@ -1,3 +1,4 @@
+import { DeletionService } from '../src/identity/deletion.service';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import {
@@ -890,5 +891,383 @@ describe('Recovery 04 transaction, terminal state and offline origin invariants'
     } finally {
       await h.close();
     }
+  });
+  async function reconcileFixture() {
+    const f = await fixture('Recovery 04.2');
+    const a = planOperation(
+      {
+        ...f.payload.planSnapshot,
+        name: 'A',
+        revisionOrigin: { id: randomUUID(), parentId: null },
+      },
+      f.payload.planVersion,
+    );
+    const b = planOperation(
+      {
+        ...f.payload.planSnapshot,
+        name: 'B',
+        revisionOrigin: { id: randomUUID(), parentId: a.payload.revisionOrigin!.id },
+      },
+      f.payload.planVersion,
+    );
+    await request(server())
+      .patch(`/api/v1/workout-plans/${f.payload.planId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ baseVersion: f.payload.planVersion, name: 'C' })
+      .expect(200);
+    const conflict = await post(f.token, '/sync', { operations: [a] }, 201);
+    expect(conflict.body.results[0].status).toBe('conflict');
+    // A request already sent must remain byte-identical when it is closed later.
+    const attempted = await post(f.token, '/sync', { operations: [b] }, 201);
+    expect(attempted.body.results[0].code).toBe('plan_dependency_missing');
+    return {
+      f,
+      a,
+      b,
+      body: {
+        id: randomUUID(),
+        expectedVersion: f.payload.planVersion + 1,
+        choice: 'keep_server',
+        descendants: 'archive',
+        sourceOriginId: null as string | null,
+        operations: [a, b],
+      },
+    };
+  }
+  it.each([
+    ['keep_server', 'archive'],
+    ['keep_server', 'reapply'],
+    ['keep_both', 'archive'],
+    ['keep_both', 'reapply'],
+  ] as const)(
+    'Recovery 04.2 %s/%s has one immutable receipt, closes attempted operations and never changes original snapshots',
+    async (choice, descendants) => {
+      const s = await reconcileFixture();
+      const body = {
+        ...s.body,
+        choice,
+        descendants,
+        sourceOriginId: descendants === 'reapply' ? s.b.payload.revisionOrigin!.id : null,
+      };
+      const before = await db.syncOperation.findUniqueOrThrow({ where: { id: s.a.id } });
+      const path = `/workout-plan-conflicts/${s.a.id}/reconcile`;
+      const result = await post(s.f.token, path, body, 200);
+      expect(result.body.plan.name).toBe(
+        choice === 'keep_server' && descendants === 'reapply' ? 'B' : 'C',
+      );
+      expect(result.body.preservedPlan?.name ?? null).toBe(
+        choice === 'keep_both' ? (descendants === 'reapply' ? 'B' : 'A (cópia)') : null,
+      );
+      expect(await db.planOperationClosure.count({ where: { decisionId: body.id } })).toBe(2);
+      expect(await db.planReconciliation.count({ where: { id: body.id } })).toBe(1);
+      expect(await db.syncOperation.findUniqueOrThrow({ where: { id: s.a.id } })).toEqual(before);
+      const stored = await db.planReconciliation.findUniqueOrThrow({ where: { id: body.id } });
+      expect(stored.request).toEqual(body);
+      expect(stored.result).toEqual(result.body);
+      const retry = await post(s.f.token, path, body, 200);
+      expect(retry.body).toEqual(result.body);
+      for (const op of [s.a, s.b]) {
+        const late = await post(s.f.token, '/sync', { operations: [op] }, 201);
+        expect(late.body.results[0]).toMatchObject({
+          status: 'rejected',
+          code: 'operation_closed',
+        });
+      }
+      if (descendants === 'reapply') {
+        expect(result.body.derived.sourceOriginId).toBe(s.b.payload.revisionOrigin!.id);
+        expect(result.body.derived.operation.payload.revisionOrigin.parentId).toBeNull();
+        const origin = await db.planRevisionOrigin.findUniqueOrThrow({
+          where: { id: result.body.derived.revision.originId },
+        });
+        expect(origin.snapshot).toEqual(result.body.derived.revision.snapshot);
+        expect(
+          await db.syncOperation.count({
+            where: { id: result.body.derived.operation.id, status: 'applied' },
+          }),
+        ).toBe(1);
+        const repeated = await post(
+          s.f.token,
+          '/sync',
+          { operations: [result.body.derived.operation] },
+          201,
+        );
+        expect(repeated.body.results[0].status).toBe('applied');
+      }
+      expect(
+        await db.planRevisionOrigin.count({
+          where: { id: { in: [s.a.payload.revisionOrigin!.id, s.b.payload.revisionOrigin!.id] } },
+        }),
+      ).toBe(0);
+      await post(
+        s.f.token,
+        path,
+        { ...body, descendants: descendants === 'archive' ? 'reapply' : 'archive' },
+        409,
+      );
+      const target = result.body.preservedPlan ?? result.body.plan;
+      await request(server())
+        .patch(`/api/v1/workout-plans/${target.id}`)
+        .set('Authorization', `Bearer ${s.f.token}`)
+        .send({ baseVersion: target.version, name: 'After decision' })
+        .expect(200);
+      expect((await post(s.f.token, path, body, 200)).body).toEqual(result.body);
+      expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(
+        choice === 'keep_both' ? 2 : 1,
+      );
+      await expect(
+        db.$executeRaw`UPDATE meutreino.plan_reconciliations SET request_hash='forged' WHERE id=${body.id}::uuid`,
+      ).rejects.toThrow();
+    },
+  );
+  it('Recovery 04.2 two devices resolving concurrently get one winner, with no second Q or E', async () => {
+    const s = await reconcileFixture();
+    const body = {
+      ...s.body,
+      choice: 'keep_both',
+      descendants: 'reapply',
+      sourceOriginId: s.b.payload.revisionOrigin!.id,
+    };
+    const login = await post(
+      s.f.token,
+      '/auth/login',
+      {
+        email: s.f.email,
+        password: s.f.password,
+        device: {
+          installationId: randomUUID(),
+          platform: 'ios',
+          appVersion: '0.1.0',
+          label: 'Second device',
+        },
+      },
+      200,
+    );
+    const results = await Promise.all(
+      [s.f.token, login.body.tokens.accessToken as string].map((token, i) =>
+        request(server())
+          .post(`/api/v1/workout-plan-conflicts/${s.a.id}/reconcile`)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ ...body, id: i ? randomUUID() : body.id }),
+      ),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(await db.planReconciliation.count({ where: { conflictId: s.a.id } })).toBe(1);
+    expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(2);
+    expect(await db.planRevisionOrigin.count({ where: { userId: s.f.userId } })).toBe(1);
+  });
+  it('Recovery 04.2 stale C and invalid operation hashes fail without partial closures or Q/E', async () => {
+    const s = await reconcileFixture();
+    await post(
+      s.f.token,
+      `/workout-plan-conflicts/${s.a.id}/reconcile`,
+      { ...s.body, expectedVersion: 1 },
+      409,
+    );
+    const invalid = { ...s.body, operations: [s.a, { ...s.b, payloadHash: '0'.repeat(64) }] };
+    await post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, invalid, 400);
+    expect(await db.planOperationClosure.count({ where: { userId: s.f.userId } })).toBe(0);
+    expect(await db.planReconciliation.count({ where: { userId: s.f.userId } })).toBe(0);
+    expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(1);
+  });
+  it('Recovery 04.2 REAL SQLite + HTTP + PostgreSQL: lost decision ACK, restart, immutable B and one Q/E', async () => {
+    const s = await reconcileFixture();
+    await post(
+      s.f.token,
+      `/workout-sessions/${s.f.payload.id}/finish`,
+      { confirmIncomplete: true },
+      200,
+    );
+    const { harness } = createRequire(__filename)(
+      '../../mobile/test/support/sqlite-harness.cjs',
+    ) as { harness: () => Promise<MobileHarness> };
+    const h = await harness();
+    try {
+      // Keep local identities tied to the actual user-owned plan and exercise IDs.
+      const dbLocal = (
+        h as unknown as { db: { runAsync: (sql: string, ...args: unknown[]) => Promise<unknown> } }
+      ).db;
+      await dbLocal.runAsync('DELETE FROM plans');
+      await dbLocal.runAsync(
+        "INSERT INTO plans(id,name,description,accent,status,version,payload,updated_at,pending,synced) VALUES(?, ?,NULL,NULL,'active',?,?,?,0,1)",
+        s.f.payload.planId,
+        'Official',
+        s.f.payload.planVersion,
+        JSON.stringify(s.f.payload.planSnapshot),
+        new Date().toISOString(),
+      );
+      const plans = h.load('plans/plan-store') as ReturnType<MobileHarness['load']> & {
+        syncPlans: (user: string) => Promise<unknown>;
+        reconcileLocalPlanConflict: (
+          user: string,
+          id: string,
+          choice: string,
+          desc: string,
+          source: string,
+        ) => Promise<void>;
+      };
+      await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
+        p.name = 'Offline A';
+      });
+      await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
+        p.name = 'Offline B';
+      });
+      const api = h.api as unknown as Record<string, (...args: never[]) => Promise<unknown>>;
+      api.pushCatalogSync = (async (operations: unknown[]) =>
+        (await post(s.f.token, '/sync', { operations }, 201)).body) as typeof api.pushCatalogSync;
+      api.listPlansRequest = (async () => ({ items: [], total: 0 })) as typeof api.listPlansRequest;
+      api.getPlanRequest = (async (id: string) =>
+        (
+          await request(server())
+            .get(`/api/v1/workout-plans/${id}`)
+            .set('Authorization', `Bearer ${s.f.token}`)
+            .expect(200)
+        ).body) as typeof api.getPlanRequest;
+      await plans.syncPlans(h.user);
+      const rows = await (
+        h as unknown as {
+          db: { getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>> };
+        }
+      ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
+      let lost = true;
+      api.reconcilePlanConflictRequest = (async (id: string, body: object) => {
+        const response = await post(
+          s.f.token,
+          `/workout-plan-conflicts/${id}/reconcile`,
+          body,
+          200,
+        );
+        if (lost) {
+          lost = false;
+          throw new h.errors.ApiClientError('lost ACK', 0, 'network_error');
+        }
+        return response.body;
+      }) as typeof api.reconcilePlanConflictRequest;
+      await expect(
+        plans.reconcileLocalPlanConflict(
+          h.user,
+          s.f.payload.planId,
+          'keep_both',
+          'reapply',
+          rows[1]!.id,
+        ),
+      ).rejects.toThrow('Retomar');
+      await h.reopen();
+      const reopened = h.load('plans/plan-store') as typeof plans;
+      await reopened.reconcileLocalPlanConflict(
+        h.user,
+        s.f.payload.planId,
+        'keep_both',
+        'reapply',
+        rows[1]!.id,
+      );
+      const after = await (
+        h as unknown as {
+          db: { getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>> };
+        }
+      ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
+      expect(after.slice(0, 2).map((r) => r.snapshot)).toEqual(rows.map((r) => r.snapshot));
+      expect(after).toHaveLength(3);
+      expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(2);
+      const decisions = await db.planReconciliation.findMany({ where: { userId: s.f.userId } });
+      expect(decisions).toHaveLength(1);
+      const result = decisions[0]!.result as unknown as { preservedPlan: { id: string } };
+      await reopened.updateLocalPlan(h.user, result.preservedPlan.id, (p) => {
+        p.name = 'Edit after recovery';
+      });
+      await reopened.syncPlans(h.user);
+      expect(
+        (await db.workoutPlan.findUniqueOrThrow({ where: { id: result.preservedPlan.id } })).name,
+      ).toBe('Edit after recovery');
+    } finally {
+      await h.close();
+    }
+  });
+  it('Recovery 04.2 decision insertion failure rolls back Q, E, closures and all plan changes', async () => {
+    const s = await reconcileFixture();
+    const body = {
+      ...s.body,
+      choice: 'keep_both',
+      descendants: 'reapply',
+      sourceOriginId: s.b.payload.revisionOrigin!.id,
+    };
+    const plans = async () =>
+      JSON.stringify(
+        await db.workoutPlan.findMany({
+          where: { ownerUserId: s.f.userId },
+          include: { revisions: true },
+        }),
+      );
+    const before = await plans();
+    await db.$executeRawUnsafe(
+      `CREATE FUNCTION meutreino.recovery042_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='${body.id}'::uuid THEN RAISE EXCEPTION 'injected decision failure'; END IF; RETURN NEW; END; $$`,
+    );
+    await db.$executeRawUnsafe(
+      'CREATE TRIGGER recovery042_failure BEFORE INSERT ON meutreino.plan_reconciliations FOR EACH ROW EXECUTE FUNCTION meutreino.recovery042_failure()',
+    );
+    try {
+      await post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, body, 500);
+      expect(await plans()).toBe(before);
+      expect(await db.planReconciliation.count({ where: { id: body.id } })).toBe(0);
+      expect(await db.planOperationClosure.count({ where: { decisionId: body.id } })).toBe(0);
+      expect(await db.planRevisionOrigin.count({ where: { userId: s.f.userId } })).toBe(0);
+      expect(
+        (await db.workoutPlanConflict.findUniqueOrThrow({ where: { id: s.a.id } })).status,
+      ).toBe('open');
+    } finally {
+      await db.$executeRawUnsafe(
+        'DROP TRIGGER recovery042_failure ON meutreino.plan_reconciliations',
+      );
+      await db.$executeRawUnsafe('DROP FUNCTION meutreino.recovery042_failure()');
+    }
+    await post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, body, 200);
+    expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(2);
+  });
+  it('Recovery 04.2 same decision concurrent retries return exactly one immutable result', async () => {
+    const s = await reconcileFixture();
+    const body = {
+      ...s.body,
+      choice: 'keep_both',
+      descendants: 'reapply',
+      sourceOriginId: s.b.payload.revisionOrigin!.id,
+    };
+    const results = await Promise.all(
+      [0, 1].map(() => post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, body, 200)),
+    );
+    expect(results[0]!.body).toEqual(results[1]!.body);
+    expect(await db.planReconciliation.count({ where: { id: body.id } })).toBe(1);
+    expect(await db.planRevisionOrigin.count({ where: { userId: s.f.userId } })).toBe(1);
+  });
+  it('Recovery 04.2 in-flight old operation races closure without reactivating B', async () => {
+    const s = await reconcileFixture();
+    const results = await Promise.all([
+      post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, s.body, 200),
+      post(s.f.token, '/sync', { operations: [s.b] }, 201),
+    ]);
+    expect(results[1]!.body.results[0].status).not.toBe('applied');
+    expect(
+      (await db.workoutPlan.findUniqueOrThrow({ where: { id: s.f.payload.planId } })).name,
+    ).toBe('C');
+    const later = await post(s.f.token, '/sync', { operations: [s.b] }, 201);
+    expect(later.body.results[0].code).toBe('operation_closed');
+  });
+  it('Recovery 04.2 decisions are isolated by user and included in export and purge', async () => {
+    const s = await reconcileFixture();
+    const other = await fixture('Reconciliation outsider');
+    await post(other.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, s.body, 404);
+    await post(s.f.token, `/workout-plan-conflicts/${s.a.id}/reconcile`, s.body, 200);
+    const exported = await post(s.f.token, '/me/export', {}, 201);
+    const file = await request(server())
+      .get(`/api/v1/me/export/${exported.body.id}/download`)
+      .set('Authorization', `Bearer ${s.f.token}`)
+      .expect(200);
+    const data = Buffer.isBuffer(file.body) ? JSON.parse(file.body.toString('utf8')) : file.body;
+    expect(data.planReconciliations).toHaveLength(1);
+    expect(data.planReconciliations[0].id).toBe(s.body.id);
+    expect(data.planOperationClosures).toHaveLength(2);
+    await app.get(DeletionService).purge(s.f.userId);
+    expect(await db.planReconciliation.count({ where: { userId: s.f.userId } })).toBe(0);
+    expect(await db.planOperationClosure.count({ where: { userId: s.f.userId } })).toBe(0);
+    expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(0);
+    expect((await db.user.findUniqueOrThrow({ where: { id: s.f.userId } })).status).toBe('deleted');
   });
 });

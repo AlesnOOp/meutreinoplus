@@ -212,6 +212,7 @@ async function harness(
           ?.snapshot ?? remotePlans.get(id),
       ),
     }),
+    getPlanRequest: async (id) => copies(remotePlans.get(id)),
     listPlansRequest: async () => ({
       items: copies([...remotePlans.values()]),
       total: remotePlans.size,

@@ -145,7 +145,9 @@ export async function claimOperations(
     // One unresolved revision per entity at a time. Earlier attempts retain their idempotency key.
     const rows = await tx.getAllAsync<QueuedRevision>(
       `SELECT q.* FROM sync_queue q
-      WHERE q.status = 'pending' AND q.entity_type IN (${types.map(() => '?').join(',')})
+      WHERE q.status = 'pending'
+      AND (q.entity_type<>'workout_plan' OR NOT EXISTS(SELECT 1 FROM local_plan_reconciliations r WHERE r.plan_id=q.entity_id AND r.result IS NULL))
+      AND q.entity_type IN (${types.map(() => '?').join(',')})
       AND NOT EXISTS (SELECT 1 FROM sync_queue older WHERE older.entity_type = q.entity_type
         AND older.entity_id = q.entity_id AND older.rowid < q.rowid AND older.status IN ('pending','in_flight','error'))
       ORDER BY q.rowid ASC LIMIT 20`,

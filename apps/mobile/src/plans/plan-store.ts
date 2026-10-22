@@ -7,11 +7,18 @@ import {
   type PlanExerciseInput,
   type PlanSyncPayload,
   type PlanView,
+  planReconcileRequestSchema,
+  type PlanReconcileResult,
 } from '@meutreino/shared';
 import * as Crypto from 'expo-crypto';
 import { pushCatalogSync } from '@/api/catalog';
 import { isNetworkError } from '@/api/errors';
-import { listPlansRequest, resolvePlanConflictRequest } from '@/api/plans';
+import {
+  getPlanRequest,
+  reconcilePlanConflictRequest,
+  listPlansRequest,
+  resolvePlanConflictRequest,
+} from '@/api/plans';
 import { syncCatalog } from '@/catalog/catalog-store';
 import {
   captureRevisions,
@@ -54,6 +61,7 @@ export type LocalPlan = PlanSyncPayload & {
   originRevisionId?: string | null;
   officialSnapshot?: PlanView;
   resolutionPendingChoice?: PlanChoice;
+  reconciliationPending?: boolean;
   version: number;
   pending: boolean;
   synced: boolean;
@@ -78,7 +86,15 @@ export async function readLocalPlan(userId: string, planId: string): Promise<Loc
   const row = await database.getFirstAsync<PlanRow>(`SELECT * FROM plans WHERE id = ?`, planId);
   if (!row) return null;
   const intent = await readPlanConflictIntent(database, planId);
-  return { ...mapPlan(row), resolutionPendingChoice: intent?.choice };
+  const reconciliation = await database.getFirstAsync(
+    'SELECT id FROM local_plan_reconciliations WHERE plan_id=? AND result IS NULL',
+    planId,
+  );
+  return {
+    ...mapPlan(row),
+    resolutionPendingChoice: intent?.choice,
+    reconciliationPending: Boolean(reconciliation),
+  };
 }
 
 export async function createLocalPlan(
@@ -267,8 +283,12 @@ async function runPlanSync(userId: string): Promise<{ synced: boolean; conflicts
           });
           applied++;
         } else if (item.code !== 'plan_dependency_missing') {
-          conflicts += item.status === 'conflict' ? 1 : 0;
-          await localTransaction(database, async (tx) => {
+          const flagged = await localTransaction(database, async (tx) => {
+            const active = await tx.getFirstAsync<{ status: string }>(
+              'SELECT status FROM sync_queue WHERE id=?',
+              row.id,
+            );
+            if (!active || ['done', 'superseded'].includes(active.status)) return false;
             await tx.runAsync(
               "UPDATE sync_queue SET status='error',last_error=?,updated_at=? WHERE id=?",
               item.code ?? item.status,
@@ -281,7 +301,9 @@ async function runPlanSync(userId: string): Promise<{ synced: boolean; conflicts
                 row.id,
                 row.entity_id,
               );
+            return item.status === 'conflict';
           });
+          conflicts += flagged ? 1 : 0;
         }
       }
     } catch (error) {
@@ -308,6 +330,13 @@ export async function resolveLocalConflict(
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
   const prepared = await localTransaction(database, async (tx) => {
+    if (
+      await tx.getFirstAsync(
+        'SELECT id FROM local_plan_reconciliations WHERE plan_id=? AND result IS NULL',
+        planId,
+      )
+    )
+      throw new Error('Retome a reconciliação pendente antes de escolher outra decisão.');
     const row = await tx.getFirstAsync<PlanRow>('SELECT * FROM plans WHERE id=?', planId);
     if (!row?.conflict_operation_id) return null;
     const intent = await readPlanConflictIntent(tx, planId);
@@ -411,6 +440,250 @@ export async function resolveLocalConflict(
       'DELETE FROM plan_conflict_intents WHERE plan_id=? AND conflict_id=?',
       planId,
       row.conflict_operation_id,
+    );
+  });
+}
+
+export async function reconcileLocalPlanConflict(
+  userId: string,
+  planId: string,
+  choice: 'keep_server' | 'keep_both',
+  descendants: 'archive' | 'reapply',
+  sourceOriginId: string | null = null,
+  expectedVersion?: number,
+  resumeOnly = false,
+  previewOriginId?: string,
+): Promise<void> {
+  const database = await openLocalDatabase(userId);
+  let pending = await database.getFirstAsync<{ id: string; conflict_id: string; request: string }>(
+    'SELECT * FROM local_plan_reconciliations WHERE plan_id=? AND result IS NULL',
+    planId,
+  );
+  if (!pending) {
+    if (resumeOnly)
+      throw new Error(
+        'Não existe decisão pendente. Reabra a ficha e confirme uma nova prévia antes de escolher novamente.',
+      );
+    const remote = expectedVersion ? { version: expectedVersion } : await getPlanRequest(planId);
+    pending = await localTransaction(database, async (tx) => {
+      const running = await tx.getFirstAsync<{ id: string; conflict_id: string; request: string }>(
+        'SELECT * FROM local_plan_reconciliations WHERE plan_id=? AND result IS NULL',
+        planId,
+      );
+      if (running) return running;
+      if (await readPlanConflictIntent(tx, planId))
+        throw new Error('Retome a decisão anterior antes de reconciliar.');
+      const row = await tx.getFirstAsync<PlanRow>('SELECT * FROM plans WHERE id=?', planId);
+      if (!row?.conflict_operation_id) throw new Error('Não existe conflito aberto nesta ficha.');
+      if (previewOriginId && row.origin_revision_id !== previewOriginId)
+        throw new Error(
+          'A edição local mudou durante a prévia. Reabra a ficha e confirme novamente; nada foi reconciliado.',
+        );
+      const root = await tx.getFirstAsync<{ payload: string }>(
+        'SELECT payload FROM sync_queue WHERE id=?',
+        row.conflict_operation_id,
+      );
+      const source = root ? planSyncMutationSchema.parse(JSON.parse(root.payload)) : null;
+      const graph = await inspectPlanConflictDependencies(
+        tx,
+        planId,
+        row.conflict_operation_id,
+        source?.revisionOrigin?.id ?? null,
+      );
+      if (graph.missingOrigin || !source?.revisionOrigin || graph.unknownOperations.length)
+        throw new Error(
+          'A cadeia não possui provas suficientes. Preserve o aparelho e solicite recuperação assistida.',
+        );
+      const affected = new Set(graph.revisions.filter((r) => !r.server_version).map((r) => r.id));
+      if (
+        graph.sessions.some(
+          (s) => !s.source_plan_revision_id || affected.has(s.source_plan_revision_id),
+        )
+      )
+        throw new Error(
+          'Há treino dependente de revisão não publicada. Escolha “Manter a versão deste aparelho”; importar histórico não está autorizado.',
+        );
+      const operations = graph.operations.map((op) => ({
+        id: op.id,
+        entityType: 'workout_plan',
+        entityId: op.entity_id,
+        operation: op.operation,
+        idempotencyKey: op.idempotency_key,
+        payloadHash: op.payload_hash,
+        baseVersion: op.base_version,
+        createdAt: op.created_at,
+        payload: JSON.parse(op.payload),
+      }));
+      const request = planReconcileRequestSchema.parse({
+        id: Crypto.randomUUID(),
+        choice,
+        descendants,
+        sourceOriginId,
+        expectedVersion: remote.version,
+        operations,
+      });
+      if (descendants === 'reapply' && !graph.descendants.some((r) => r.id === sourceOriginId))
+        throw new Error('Selecione uma edição posterior da prévia para reaplicar.');
+      await tx.runAsync(
+        'INSERT INTO local_plan_reconciliations(id,plan_id,conflict_id,request,created_at) VALUES(?,?,?,?,?)',
+        request.id,
+        planId,
+        row.conflict_operation_id,
+        JSON.stringify(request),
+        new Date().toISOString(),
+      );
+      return {
+        id: request.id,
+        conflict_id: row.conflict_operation_id,
+        request: JSON.stringify(request),
+      };
+    });
+  }
+  const request = planReconcileRequestSchema.parse(JSON.parse(pending.request));
+  let result: PlanReconcileResult;
+  try {
+    result = await reconcilePlanConflictRequest(pending.conflict_id, request);
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      error.code === 'reconciliation_stale'
+    ) {
+      await localTransaction(database, async (tx) => {
+        await tx.runAsync(
+          'UPDATE local_plan_reconciliations SET result=? WHERE id=? AND result IS NULL',
+          JSON.stringify({ outcome: 'rejected', code: 'reconciliation_stale' }),
+          request.id,
+        );
+      });
+      throw new Error(
+        'A ficha mudou antes da decisão e nada foi reconciliado. Reabra a ficha para revisar a versão atual e escolher novamente.',
+      );
+    }
+    throw new Error(
+      'A reconciliação não foi confirmada. Reabra esta ficha e use “Retomar reconciliação”. Não troque a decisão nem apague os dados. Se outro aparelho já resolveu o conflito ou a recusa persistir, solicite recuperação assistida.',
+    );
+  }
+  if (
+    result.id !== pending.id ||
+    result.choice !== request.choice ||
+    result.closed.length !== request.operations.length ||
+    request.operations.some((op) => !result.closed.some((item) => item.id === op.id))
+  )
+    throw new Error('Recibo incompatível; preserve os dados e retome a decisão.');
+  if (
+    result.plan.id !== planId ||
+    (request.choice === 'keep_both'
+      ? !result.preservedPlan || result.preservedPlan.id === planId
+      : result.preservedPlan !== null) ||
+    (request.descendants === 'reapply') !== Boolean(result.derived)
+  )
+    throw new Error('Recibo incompatível com a decisão; preserve os dados e retome.');
+  if (result.derived) {
+    const d = result.derived;
+    const source = request.operations.find(
+      (op) => op.payload.revisionOrigin?.id === request.sourceOriginId,
+    );
+    const target = request.choice === 'keep_both' ? result.preservedPlan! : result.plan;
+    if (
+      !source ||
+      d.sourceOriginId !== request.sourceOriginId ||
+      d.operation.entityId !== target.id ||
+      d.revision.originId !== d.operation.payload.revisionOrigin?.id ||
+      d.operation.payload.revisionOrigin?.parentId !== null ||
+      d.revision.version !== d.revision.snapshot.version ||
+      canonicalPlanContent(d.operation.payload) !== canonicalPlanContent(d.revision.snapshot)
+    )
+      throw new Error('A nova edição não confirma sua origem. Preserve os dados e retome.');
+    const mapped = {
+      ...source.payload,
+      id: d.operation.payload.id,
+      exercises: source.payload.exercises.map((ex, i) => ({
+        ...ex,
+        id: d.operation.payload.exercises[i]?.id ?? ex.id,
+        sets: ex.sets.map((set, j) => ({
+          ...set,
+          id: d.operation.payload.exercises[i]?.sets[j]?.id ?? set.id,
+        })),
+      })),
+    };
+    const hash = await Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      canonicalJsonString(d.operation.payload),
+    );
+    if (
+      hash !== d.operation.payloadHash ||
+      canonicalPlanContent(mapped) !== canonicalPlanContent(d.operation.payload)
+    )
+      throw new Error(
+        'A prescrição reaplicada diverge da edição escolhida. Nada foi confirmado localmente.',
+      );
+  }
+  await localTransaction(database, async (tx) => {
+    const intent = await tx.getFirstAsync<{ result: string | null }>(
+      'SELECT result FROM local_plan_reconciliations WHERE id=?',
+      request.id,
+    );
+    if (intent?.result) return;
+    for (const op of request.operations)
+      await tx.runAsync(
+        "UPDATE sync_queue SET status=CASE WHEN status='done' OR ?=1 THEN 'done' ELSE 'superseded' END,last_error=NULL,updated_at=? WHERE id=?",
+        result.closed.find((item) => item.id === op.id)?.status === 'applied' ? 1 : 0,
+        new Date().toISOString(),
+        op.id,
+      );
+    await writeServerPlan(tx, result.plan);
+    if (result.preservedPlan) await writeServerPlan(tx, result.preservedPlan);
+    if (result.derived) {
+      const d = result.derived;
+      const target = await tx.getFirstAsync<PlanRow>(
+        'SELECT * FROM plans WHERE id=?',
+        d.operation.entityId,
+      );
+      const next = (target?.local_revision ?? 0) + 1;
+      await tx.runAsync(
+        'INSERT INTO local_plan_revisions(id,plan_id,local_revision,snapshot,parent_id,base_version,server_version,official_snapshot,created_at) VALUES(?,?,?,?,NULL,?,?,?,?)',
+        d.revision.originId,
+        d.operation.entityId,
+        next,
+        JSON.stringify(planSyncPayloadSchema.parse(d.operation.payload)),
+        d.operation.baseVersion,
+        d.revision.version,
+        JSON.stringify(d.revision.snapshot),
+        d.operation.createdAt,
+      );
+      await tx.runAsync(
+        'INSERT INTO local_plan_derivations(origin_id,source_origin_id,decision_id,created_at) VALUES(?,?,?,?)',
+        d.revision.originId,
+        d.sourceOriginId,
+        request.id,
+        new Date().toISOString(),
+      );
+      await tx.runAsync(
+        "INSERT INTO sync_queue(id,entity_type,entity_id,operation,idempotency_key,payload_hash,payload,base_version,status,created_at,updated_at,local_revision) VALUES(?,'workout_plan',?,'upsert',?,?,?,?,'done',?,?,?)",
+        d.operation.id,
+        d.operation.entityId,
+        d.operation.idempotencyKey,
+        d.operation.payloadHash,
+        JSON.stringify(d.operation.payload),
+        d.operation.baseVersion,
+        d.operation.createdAt,
+        d.operation.createdAt,
+        next,
+      );
+      await tx.runAsync(
+        'UPDATE plans SET local_revision=?,acknowledged_revision=?,origin_revision_id=? WHERE id=?',
+        next,
+        next,
+        d.revision.originId,
+        d.operation.entityId,
+      );
+    }
+    await tx.runAsync(
+      'UPDATE local_plan_reconciliations SET result=? WHERE id=?',
+      JSON.stringify(result),
+      request.id,
     );
   });
 }
