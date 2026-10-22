@@ -520,7 +520,7 @@ test('SQLite v4 migration keeps legacy queue and dirty newer row, then converges
   assert.equal(row.synced, 0);
   assert.equal(
     (await h.db.getFirstAsync("SELECT value FROM local_meta WHERE key='schema_version'")).value,
-    '7',
+    '8',
   );
   const queued = await h.db.getAllAsync(
     "SELECT * FROM sync_queue WHERE entity_type='gym' ORDER BY rowid",

@@ -1,3 +1,4 @@
+import { resolutionLabel } from './conflict-containment';
 import { planColors } from '@/theme/colors';
 import {
   BodyText as Text,
@@ -307,6 +308,11 @@ export function PlanDetailScreen() {
       {error ? <Notice tone="error" message={error} /> : null}
       {plan.pending ? (
         <Notice message="Há alterações desta ficha ainda não sincronizadas. Elas permanecem neste aparelho." />
+      ) : null}
+      {plan.resolutionPendingChoice ? (
+        <Notice
+          message={`Uma decisão aguarda confirmação. Repita “${resolutionLabel(plan.resolutionPendingChoice)}” nas opções abaixo para retomar. Edições e novos treinos podem aguardar essa confirmação.`}
+        />
       ) : null}
       {plan.conflictOperationId ? (
         <ConflictActions
@@ -921,22 +927,47 @@ function ConflictActions({
   online: boolean;
   onChoice: (choice: 'keep_server' | 'keep_local' | 'keep_both') => Promise<void>;
 }) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function choose(choice: 'keep_server' | 'keep_local' | 'keep_both') {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onChoice(choice);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : 'Não foi possível confirmar. Repita a mesma escolha.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
     <View style={{ gap: 8 }}>
+      {error ? <Notice tone="error" message={error} /> : null}
       <Notice message="Esta ficha mudou em outro lugar. As duas versões continuam disponíveis." />
       {online ? null : (
         <Notice message="Sem conexão, a revisão fica para depois. Nada é apagado neste aparelho." />
       )}
-      <Button label="Manter a versão deste aparelho" onPress={() => void onChoice('keep_local')} />
+      <Button
+        label="Manter a versão deste aparelho"
+        disabled={busy}
+        onPress={() => void choose('keep_local')}
+      />
       <Button
         label="Manter a versão sincronizada"
         variant="secondary"
-        onPress={() => void onChoice('keep_server')}
+        disabled={busy}
+        onPress={() => void choose('keep_server')}
       />
       <Button
         label="Guardar as duas fichas"
         variant="secondary"
-        onPress={() => void onChoice('keep_both')}
+        disabled={busy}
+        onPress={() => void choose('keep_both')}
       />
     </View>
   );

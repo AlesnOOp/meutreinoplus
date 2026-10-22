@@ -5,7 +5,7 @@ import {
 } from '@meutreino/shared';
 import * as SQLite from 'expo-sqlite';
 
-const SCHEMA_VERSION = '7';
+const SCHEMA_VERSION = '8';
 
 export type LocalDatabaseStatus = {
   ready: true;
@@ -36,6 +36,11 @@ async function initialize(userId: string): Promise<SQLite.SQLiteDatabase> {
   await database.execAsync('PRAGMA journal_mode = WAL;');
   await database.execAsync('PRAGMA foreign_keys = ON;');
   await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS plan_conflict_intents (
+      plan_id TEXT PRIMARY KEY NOT NULL, conflict_id TEXT NOT NULL,
+      choice TEXT NOT NULL CHECK(choice IN ('keep_server','keep_local','keep_both')),
+      payload TEXT, created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS local_plan_revisions (
       id TEXT PRIMARY KEY NOT NULL, plan_id TEXT NOT NULL, local_revision INTEGER NOT NULL,
       snapshot TEXT NOT NULL, parent_id TEXT, base_version INTEGER,

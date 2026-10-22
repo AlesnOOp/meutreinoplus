@@ -24,6 +24,14 @@ import {
 } from '@/db/sync-state';
 import { openLocalDatabase } from '@/db/local-database';
 
+import {
+  assertPlanCanGainDependencies,
+  inspectPlanConflictDependencies,
+  readPlanConflictIntent,
+  resolutionLabel,
+  type PlanChoice,
+} from './conflict-containment';
+
 type Database = Awaited<ReturnType<typeof openLocalDatabase>>;
 
 type PlanRow = {
@@ -45,6 +53,7 @@ type PlanRow = {
 export type LocalPlan = PlanSyncPayload & {
   originRevisionId?: string | null;
   officialSnapshot?: PlanView;
+  resolutionPendingChoice?: PlanChoice;
   version: number;
   pending: boolean;
   synced: boolean;
@@ -67,7 +76,9 @@ export async function listLocalPlans(
 export async function readLocalPlan(userId: string, planId: string): Promise<LocalPlan | null> {
   const database = await openLocalDatabase(userId);
   const row = await database.getFirstAsync<PlanRow>(`SELECT * FROM plans WHERE id = ?`, planId);
-  return row ? mapPlan(row) : null;
+  if (!row) return null;
+  const intent = await readPlanConflictIntent(database, planId);
+  return { ...mapPlan(row), resolutionPendingChoice: intent?.choice };
 }
 
 export async function createLocalPlan(
@@ -296,31 +307,70 @@ export async function resolveLocalConflict(
   choice: 'keep_server' | 'keep_local' | 'keep_both',
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
-  const row = await database.getFirstAsync<PlanRow>(`SELECT * FROM plans WHERE id = ?`, planId);
-  if (!row?.conflict_operation_id) {
-    return;
-  }
-  const operation = await database.getFirstAsync<{
-    id: string;
-    payload: string;
-    local_revision: number;
-  }>('SELECT id,payload,local_revision FROM sync_queue WHERE id=?', row.conflict_operation_id);
-  const sent = operation ? planSyncMutationSchema.parse(JSON.parse(operation.payload)) : null;
-  const dependency = sent?.revisionOrigin
-    ? await database.getFirstAsync(
-        `SELECT s.id FROM sessions s JOIN local_plan_revisions r ON s.source_plan_revision_id=r.id WHERE r.plan_id=? AND r.server_version IS NULL AND s.pending=1 LIMIT 1`,
+  const prepared = await localTransaction(database, async (tx) => {
+    const row = await tx.getFirstAsync<PlanRow>('SELECT * FROM plans WHERE id=?', planId);
+    if (!row?.conflict_operation_id) return null;
+    const intent = await readPlanConflictIntent(tx, planId);
+    if (intent && (intent.conflict_id !== row.conflict_operation_id || intent.choice !== choice))
+      throw new Error(
+        `Uma decisão aguarda confirmação. Repita “${resolutionLabel(intent.choice)}” para retomá-la antes de escolher outra opção.`,
+      );
+    const operation = await tx.getFirstAsync<{
+      id: string;
+      payload: string;
+      local_revision: number;
+    }>('SELECT id,payload,local_revision FROM sync_queue WHERE id=?', row.conflict_operation_id);
+    const sent = operation ? planSyncMutationSchema.parse(JSON.parse(operation.payload)) : null;
+    if (!intent) {
+      const graph = await inspectPlanConflictDependencies(
+        tx,
         planId,
+        row.conflict_operation_id,
+        sent?.revisionOrigin?.id ?? null,
+      );
+      if (graph.missingOrigin && sent?.revisionOrigin)
+        throw new Error(
+          'A origem local desta revisão está ausente. As decisões foram bloqueadas para preservar os dados. Preserve o backup deste aparelho e solicite recuperação assistida; não apague a ficha nem reinstale o aplicativo.',
+        );
+      if (
+        choice !== 'keep_local' &&
+        (graph.missingOrigin ||
+          graph.descendants.length ||
+          graph.sessions.length ||
+          graph.unknownOperations.length)
       )
-    : null;
-  if (dependency && choice !== 'keep_local')
+        throw new Error(
+          `Esta revisão possui alterações posteriores ou treino dependente (${graph.descendants.length} revisões, ${graph.sessions.length} treinos). Escolha “Manter a versão deste aparelho” para publicar a origem e retomar a sincronização. Depois revise as edições seguintes. Nada foi descartado.`,
+        );
+    }
+    const requestPayload = intent
+      ? intent.payload
+        ? planSyncPayloadSchema.parse(JSON.parse(intent.payload))
+        : undefined
+      : choice === 'keep_server'
+        ? undefined
+        : planSyncPayloadSchema.parse(sent ?? mapPlan(row));
+    if (!intent)
+      await tx.runAsync(
+        'INSERT INTO plan_conflict_intents(plan_id,conflict_id,choice,payload,created_at) VALUES(?,?,?,?,?)',
+        planId,
+        row.conflict_operation_id,
+        choice,
+        requestPayload ? JSON.stringify(requestPayload) : null,
+        new Date().toISOString(),
+      );
+    return { row, operation, sent, requestPayload };
+  });
+  if (!prepared) return;
+  const { row, operation, sent, requestPayload } = prepared;
+  let result: Awaited<ReturnType<typeof resolvePlanConflictRequest>>;
+  try {
+    result = await resolvePlanConflictRequest(row.conflict_operation_id!, choice, requestPayload);
+  } catch {
     throw new Error(
-      'Esta revisão foi usada em um treino pendente. Mantenha a versão local para preservar a revisão original antes das edições posteriores.',
+      `A confirmação da decisão não chegou. Os dados continuam preservados. Repita “${resolutionLabel(choice)}” neste conflito para retomar a mesma decisão; não escolha outra opção ainda. Se a recusa persistir, preserve este aparelho e solicite recuperação assistida.`,
     );
-  const result = await resolvePlanConflictRequest(
-    row.conflict_operation_id,
-    choice,
-    choice === 'keep_server' ? undefined : (sent ?? mapPlan(row)),
-  );
+  }
   if (
     sent?.revisionOrigin &&
     choice === 'keep_local' &&
@@ -357,6 +407,11 @@ export async function resolveLocalConflict(
         planId,
       );
     if (result.preservedPlan) await writeServerPlan(tx, result.preservedPlan);
+    await tx.runAsync(
+      'DELETE FROM plan_conflict_intents WHERE plan_id=? AND conflict_id=?',
+      planId,
+      row.conflict_operation_id,
+    );
   });
 }
 
@@ -369,6 +424,7 @@ async function commitInTransaction(
   plan: LocalPlan,
   baseVersion: number | null,
 ) {
+  await assertPlanCanGainDependencies(database, plan.id);
   const existing = await database.getFirstAsync<PlanRow>(
     'SELECT * FROM plans WHERE id = ?',
     plan.id,

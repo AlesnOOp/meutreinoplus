@@ -1,6 +1,6 @@
 # Sincronização da sessão
 
-O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 7, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
+O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 8, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
 
 ## Envio
 

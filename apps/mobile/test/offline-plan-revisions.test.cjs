@@ -241,7 +241,7 @@ test('plan conflict cannot discard the unpublished revision used by T; keep_loca
   };
   await assert.rejects(
     plans.resolveLocalConflict(h.user, plan.id, 'keep_server'),
-    /treino pendente/,
+    /treino dependente/,
   );
   assert.equal(calls, 0);
   await plans.resolveLocalConflict(h.user, plan.id, 'keep_local');

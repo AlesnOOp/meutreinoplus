@@ -34,6 +34,7 @@ import {
   revision,
   singleSync,
 } from '@/db/sync-state';
+import { assertSessionOriginAvailable } from '@/plans/conflict-containment';
 import { getPlanRevisionRequest } from '@/api/plans';
 import { readLocalPlan, syncPlans } from '@/plans/plan-store';
 
@@ -844,6 +845,7 @@ async function persistLocal(
     `SELECT * FROM sessions WHERE id = ?`,
     payload.id,
   );
+  if (!existing) await assertSessionOriginAvailable(database, payload.planId, sourceRevisionId);
   const next = (existing?.local_revision ?? 0) + 1;
   await writeSession(
     database,
