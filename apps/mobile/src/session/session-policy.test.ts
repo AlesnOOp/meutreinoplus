@@ -75,3 +75,21 @@ test('does not delete a local database that still has pending work', () => {
     synced.databaseName,
   );
 });
+
+test('offline identity requires a token, matching cached user and a transient failure', async () => {
+  const { cachedOfflineAccount } = await import('./session-policy.ts');
+  const account = { id: userId, status: 'active' } as import('@meutreino/shared').AccountView;
+  const network = { status: 0, code: 'network_error' };
+  assert.equal(cachedOfflineAccount('token', userId, account, network), account);
+  assert.equal(cachedOfflineAccount(null, userId, account, network), null);
+  assert.equal(cachedOfflineAccount('token', null, account, network), null);
+  assert.equal(cachedOfflineAccount('token', 'other', account, network), null);
+  assert.equal(cachedOfflineAccount('token', userId, null, network), null);
+  for (const status of [400, 401, 403, 404]) {
+    assert.equal(
+      cachedOfflineAccount('token', userId, account, { status, code: 'request_failed' }),
+      null,
+    );
+  }
+  assert.equal(cachedOfflineAccount('token', userId, account, new Error('invalid data')), null);
+});

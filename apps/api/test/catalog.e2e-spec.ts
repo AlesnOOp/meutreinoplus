@@ -16,7 +16,8 @@ import { PrismaService } from '../src/prisma/prisma.service';
 
 const LEG_PRESS = '10000000-0000-4000-8000-000000000002';
 const SQUAT = '10000000-0000-4000-8000-000000000001';
-const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+const PNG =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4AWNwa9ryHwAFCgJ8H5wcvwAAAABJRU5ErkJggg==';
 
 type SyncBody = {
   id: string;
@@ -172,13 +173,53 @@ describe('Catalog API', () => {
     await request(server())
       .post(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
       .set(bearer(owner.token))
+      .send({
+        contentType: 'image/png',
+        dataBase64: Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64'),
+      })
+      .expect(400);
+    await request(server())
+      .post(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
+      .set(bearer(owner.token))
       .send({ contentType: 'image/png', dataBase64: PNG })
       .expect(204);
+    const beforeRetry = await prisma.equipment.findUniqueOrThrow({
+      where: { id: equipment.body.id },
+    });
+    const mediaBefore = await prisma.mediaAsset.count({
+      where: { ownerUserId: owner.userId, kind: 'equipment_photo' },
+    });
+    // The first commit may have succeeded even if the device lost its ACK.
+    await Promise.all(
+      [1, 2].map(() =>
+        request(server())
+          .post(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
+          .set(bearer(owner.token))
+          .send({ contentType: 'image/png', dataBase64: PNG })
+          .expect(204),
+      ),
+    );
+    const afterRetry = await prisma.equipment.findUniqueOrThrow({
+      where: { id: equipment.body.id },
+    });
+    expect(afterRetry.photoAssetId).toBe(beforeRetry.photoAssetId);
+    expect(afterRetry.version).toBe(beforeRetry.version);
+    expect(
+      await prisma.mediaAsset.count({
+        where: { ownerUserId: owner.userId, kind: 'equipment_photo' },
+      }),
+    ).toBe(mediaBefore);
+    await request(server())
+      .post(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
+      .set(bearer(other.token))
+      .send({ contentType: 'image/png', dataBase64: PNG })
+      .expect(404);
     const download = await request(server())
       .get(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
       .set(bearer(owner.token))
       .expect(200);
     expect(download.headers['content-type']).toContain('image/png');
+    expect(Buffer.from(download.body as Uint8Array).equals(Buffer.from(PNG, 'base64'))).toBe(true);
     await request(server())
       .get(`/api/v1/gyms/${gym.body.id}/equipment/${equipment.body.id}/photo`)
       .set(bearer(other.token))

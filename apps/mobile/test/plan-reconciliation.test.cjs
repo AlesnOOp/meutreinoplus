@@ -358,3 +358,187 @@ test('late sync conflict ACK cannot resurrect a reconciled queue or overwrite th
   assert.equal(report.conflicts, 0);
   assert.equal(report.synced, true);
 });
+
+async function loseDecisionAck(s, mode) {
+  const send = s.h.api.reconcilePlanConflictRequest;
+  let lose = true;
+  s.h.api.reconcilePlanConflictRequest = async (...args) => {
+    const result = await send(...args);
+    if (lose) {
+      lose = false;
+      throw new s.h.errors.ApiClientError('lost committed decision ACK', 0, 'network_error');
+    }
+    return result;
+  };
+  await assert.rejects(
+    s
+      .plans()
+      .reconcileLocalPlanConflict(
+        s.h.user,
+        s.h.plan.id,
+        'keep_both',
+        mode,
+        mode === 'reapply' ? s.before[1].id : null,
+      ),
+    /Retomar/,
+  );
+  assert.equal(s.receipts.size, 1);
+  const receipt = [...s.receipts.values()][0];
+  await s.plans().syncPlans(s.h.user); // Q is visible in normal list before the ACK is recovered.
+  assert.ok(await s.plans().readLocalPlan(s.h.user, receipt.preservedPlan.id));
+  return receipt;
+}
+function liveFields(row) {
+  const { stale_remote_version, ...live } = row;
+  return live;
+}
+for (const mode of ['archive', 'reapply']) {
+  for (const successor of ['pending', 'published', 'conflict']) {
+    test(`lost ${mode} ACK preserves ${successor} F discovered on Q, including counters and next edit`, async (t) => {
+      const s = await setup(t);
+      const receipt = await loseDecisionAck(s, mode);
+      const qid = receipt.preservedPlan.id;
+      await s.plans().updateLocalPlan(s.h.user, qid, (p) => {
+        p.name = 'F - newer edit';
+      });
+      if (successor === 'published') await s.plans().syncPlans(s.h.user);
+      if (successor === 'conflict') {
+        const q = s.h.remotePlans.get(qid);
+        s.h.remotePlans.set(qid, { ...q, version: q.version + 1, name: 'Concurrent remote Q' });
+        await s.plans().syncPlans(s.h.user);
+      }
+      const liveBefore = await s.h.db.getFirstAsync('SELECT * FROM plans WHERE id=?', qid);
+      const queueBefore = await s.h.db.getAllAsync(
+        'SELECT * FROM sync_queue WHERE entity_id=? ORDER BY rowid',
+        qid,
+      );
+      const ledgerBefore = await s.h.db.getAllAsync(
+        'SELECT * FROM local_plan_revisions WHERE plan_id=? ORDER BY local_revision',
+        qid,
+      );
+      await s.h.reopen();
+      await s.plans().reconcileLocalPlanConflict(s.h.user, s.h.plan.id, 'keep_server', 'archive');
+      const liveAfter = await s.h.db.getFirstAsync('SELECT * FROM plans WHERE id=?', qid);
+      assert.deepEqual(liveFields(liveAfter), liveFields(liveBefore));
+      for (const op of queueBefore) {
+        assert.deepEqual(
+          await s.h.db.getFirstAsync('SELECT * FROM sync_queue WHERE id=?', op.id),
+          op,
+        );
+      }
+      for (const rev of ledgerBefore) {
+        assert.deepEqual(
+          await s.h.db.getFirstAsync('SELECT * FROM local_plan_revisions WHERE id=?', rev.id),
+          rev,
+        );
+      }
+      const decisions = await s.h.db.getAllAsync('SELECT * FROM local_plan_reconciliations');
+      assert.equal(decisions.length, 1);
+      assert.deepEqual(JSON.parse(decisions[0].result), receipt);
+      assert.equal((await s.h.db.getFirstAsync('SELECT COUNT(*) n FROM plans')).n, 2);
+      if (mode === 'reapply') {
+        const e = await s.h.db.getFirstAsync(
+          'SELECT * FROM local_plan_revisions WHERE id=?',
+          receipt.derived.revision.originId,
+        );
+        assert.equal(e.server_version, receipt.derived.revision.version);
+        assert.deepEqual(JSON.parse(e.official_snapshot), receipt.derived.revision.snapshot);
+        assert.equal(e.parent_id, null);
+        assert.notEqual(liveAfter.origin_revision_id, e.id);
+        assert.equal(
+          (await s.h.db.getFirstAsync('SELECT COUNT(*) n FROM local_plan_derivations')).n,
+          1,
+        );
+      }
+      // The historical append must not steal the next live revision number or parent.
+      await s.plans().updateLocalPlan(s.h.user, qid, (p) => {
+        p.name = 'G after historical ACK';
+      });
+      const g = await s.h.db.getFirstAsync(
+        'SELECT * FROM local_plan_revisions WHERE plan_id=? ORDER BY local_revision DESC LIMIT 1',
+        qid,
+      );
+      assert.equal(g.parent_id, liveBefore.origin_revision_id);
+      assert.ok(g.local_revision > liveBefore.local_revision);
+      if (successor !== 'conflict') {
+        assert.equal((await s.plans().syncPlans(s.h.user)).synced, true);
+        assert.equal(s.h.remotePlans.get(qid).name, 'G after historical ACK');
+      } else {
+        assert.equal(
+          (await s.plans().readLocalPlan(s.h.user, qid)).conflictOperationId,
+          liveBefore.conflict_operation_id,
+        );
+      }
+    });
+  }
+}
+for (const mode of ['archive', 'reapply']) {
+  test(`lost ${mode} ACK leaves a session on F attached to F and able to converge`, async (t) => {
+    const s = await setup(t);
+    const receipt = await loseDecisionAck(s, mode);
+    const qid = receipt.preservedPlan.id;
+    await s.plans().updateLocalPlan(s.h.user, qid, (p) => {
+      p.name = 'F used by session';
+    });
+    const session = await s.h.store.startLocalSession(s.h.user, qid, null, false);
+    const before = await s.h.db.getFirstAsync('SELECT * FROM sessions WHERE id=?', session.id);
+    await s.h.reopen();
+    await s.plans().reconcileLocalPlanConflict(s.h.user, s.h.plan.id, 'keep_both', mode);
+    assert.deepEqual(
+      await s.h.db.getFirstAsync('SELECT * FROM sessions WHERE id=?', session.id),
+      before,
+    );
+    assert.equal((await s.plans().readLocalPlan(s.h.user, qid)).name, 'F used by session');
+    assert.equal((await s.h.store.syncSessions(s.h.user)).synced, true);
+    const synced = await s.h.store.readLocalSession(s.h.user, session.id);
+    assert.equal(synced.planSnapshot.name, 'F used by session');
+    assert.equal(synced.pending, false);
+    assert.equal(synced.planVersion, synced.planSnapshot.version);
+    const row = await s.h.db.getFirstAsync('SELECT * FROM sessions WHERE id=?', session.id);
+    assert.equal(row.source_plan_revision_id, before.source_plan_revision_id);
+    assert.notEqual(row.source_plan_revision_id, receipt.derived?.revision.originId);
+  });
+}
+test('historical ACK rollback preserves F and intent, retries once, and serializes concurrent Q edit', async (t) => {
+  const s = await setup(t);
+  const receipt = await loseDecisionAck(s, 'reapply');
+  const qid = receipt.preservedPlan.id;
+  await s.plans().updateLocalPlan(s.h.user, qid, (p) => {
+    p.name = 'F before rollback';
+  });
+  const before = await state(s.h);
+  s.h.failNextSql(/UPDATE local_plan_reconciliations SET result/);
+  await assert.rejects(
+    s.plans().reconcileLocalPlanConflict(s.h.user, s.h.plan.id, 'keep_both', 'reapply'),
+    /Injected SQLite/,
+  );
+  assert.deepEqual(await state(s.h), before);
+  const send = s.h.api.reconcilePlanConflictRequest;
+  const entered = deferred(),
+    release = deferred();
+  s.h.api.reconcilePlanConflictRequest = async (...args) => {
+    const result = await send(...args);
+    entered.resolve();
+    await release.promise;
+    return result;
+  };
+  const ack = s.plans().reconcileLocalPlanConflict(s.h.user, s.h.plan.id, 'keep_both', 'reapply');
+  await entered.promise;
+  await s.plans().updateLocalPlan(s.h.user, qid, (p) => {
+    p.name = 'G while ACK in flight';
+  });
+  release.resolve();
+  await ack;
+  assert.equal((await s.plans().readLocalPlan(s.h.user, qid)).name, 'G while ACK in flight');
+  assert.equal((await s.plans().readLocalPlan(s.h.user, qid)).pending, true);
+  assert.equal((await s.h.db.getFirstAsync('SELECT COUNT(*) n FROM local_plan_derivations')).n, 1);
+  assert.equal(
+    (
+      await s.h.db.getFirstAsync(
+        'SELECT COUNT(*) n FROM local_plan_reconciliations WHERE result IS NOT NULL',
+      )
+    ).n,
+    1,
+  );
+  assert.equal((await s.plans().syncPlans(s.h.user)).synced, true);
+});

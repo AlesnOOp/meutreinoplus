@@ -633,15 +633,22 @@ export async function reconcileLocalPlanConflict(
         new Date().toISOString(),
         op.id,
       );
-    await writeServerPlan(tx, result.plan);
-    if (result.preservedPlan) await writeServerPlan(tx, result.preservedPlan);
+    const promoted = new Set<string>();
+    for (const plan of [result.plan, result.preservedPlan]) {
+      if (
+        plan &&
+        (await applyReconciledPlan(
+          tx,
+          plan,
+          pending.conflict_id,
+          request.operations.map((op) => op.payload.revisionOrigin?.id ?? null),
+        ))
+      )
+        promoted.add(plan.id);
+    }
     if (result.derived) {
       const d = result.derived;
-      const target = await tx.getFirstAsync<PlanRow>(
-        'SELECT * FROM plans WHERE id=?',
-        d.operation.entityId,
-      );
-      const next = (target?.local_revision ?? 0) + 1;
+      const next = await nextPlanLocalRevision(tx, d.operation.entityId);
       await tx.runAsync(
         'INSERT INTO local_plan_revisions(id,plan_id,local_revision,snapshot,parent_id,base_version,server_version,official_snapshot,created_at) VALUES(?,?,?,?,NULL,?,?,?,?)',
         d.revision.originId,
@@ -672,13 +679,16 @@ export async function reconcileLocalPlanConflict(
         d.operation.createdAt,
         next,
       );
-      await tx.runAsync(
-        'UPDATE plans SET local_revision=?,acknowledged_revision=?,origin_revision_id=? WHERE id=?',
-        next,
-        next,
-        d.revision.originId,
-        d.operation.entityId,
-      );
+      // E may be acknowledged after F already exists on Q. Record E as history,
+      // but only install it as the live origin when its snapshot was promoted.
+      if (promoted.has(d.operation.entityId))
+        await tx.runAsync(
+          'UPDATE plans SET local_revision=?,acknowledged_revision=?,origin_revision_id=? WHERE id=?',
+          next,
+          next,
+          d.revision.originId,
+          d.operation.entityId,
+        );
     }
     await tx.runAsync(
       'UPDATE local_plan_reconciliations SET result=? WHERE id=?',
@@ -686,6 +696,55 @@ export async function reconcileLocalPlanConflict(
       request.id,
     );
   });
+}
+
+/** A receipt confirms an earlier write; it is not a refresh that can discard a successor. */
+async function applyReconciledPlan(
+  tx: Database,
+  plan: PlanView,
+  conflictId: string,
+  closedOrigins: (string | null)[],
+): Promise<boolean> {
+  const current = await tx.getFirstAsync<PlanRow>('SELECT * FROM plans WHERE id=?', plan.id);
+  const active = await tx.getFirstAsync(
+    "SELECT id FROM sync_queue WHERE entity_type='workout_plan' AND entity_id=? AND status IN ('pending','in_flight','error') LIMIT 1",
+    plan.id,
+  );
+  const isClosedOrigin = Boolean(
+    current?.origin_revision_id && closedOrigins.includes(current.origin_revision_id),
+  );
+  const unrelatedConflict =
+    current?.conflict_operation_id && current.conflict_operation_id !== conflictId;
+  if (
+    active ||
+    unrelatedConflict ||
+    (current &&
+      (current.version > plan.version ||
+        (current.pending === 1 && !isClosedOrigin) ||
+        (current.version === plan.version &&
+          !isClosedOrigin &&
+          canonicalPlanContent(JSON.parse(current.payload)) !== canonicalPlanContent(plan))))
+  ) {
+    await tx.runAsync(
+      'UPDATE plans SET stale_remote_version=MAX(COALESCE(stale_remote_version,0),?) WHERE id=?',
+      plan.version,
+      plan.id,
+    );
+    return false;
+  }
+  await writeServerPlan(tx, plan);
+  return true;
+}
+
+/** Historical ACKs can append a ledger entry without changing the live revision.
+ * Future edits must allocate after BOTH counters to avoid reusing that entry's key. */
+async function nextPlanLocalRevision(tx: Database, planId: string): Promise<number> {
+  const row = await tx.getFirstAsync<{ next: number }>(
+    'SELECT MAX(COALESCE((SELECT local_revision FROM plans WHERE id=?),0),COALESCE((SELECT MAX(local_revision) FROM local_plan_revisions WHERE plan_id=?),0))+1 AS next',
+    planId,
+    planId,
+  );
+  return row!.next;
 }
 
 async function commit(userId: string, plan: LocalPlan, baseVersion: number | null) {
@@ -711,7 +770,7 @@ async function commitInTransaction(
     })),
   });
   const now = new Date().toISOString();
-  const next = (existing?.local_revision ?? 0) + 1;
+  const next = await nextPlanLocalRevision(database, plan.id);
   const id = Crypto.randomUUID();
   const parent = existing?.origin_revision_id ?? null;
   await database.runAsync(

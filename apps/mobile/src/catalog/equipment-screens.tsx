@@ -2,7 +2,8 @@ import { equipmentWriteSchema, type ExerciseView } from '@meutreino/shared';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { useCallback, useState } from 'react';
-import { Alert, Image } from 'react-native';
+import { Alert, AppState, Image, Linking } from 'react-native';
+import { photoPermissionAction, prepareEquipmentPhoto } from '@/catalog/photo-policy';
 import { downloadEquipmentPhotoRequest } from '@/api/catalog';
 import { ApiClientError } from '@/api/errors';
 import {
@@ -28,8 +29,6 @@ import {
   Screen,
   Section,
 } from '@/ui/ui';
-
-const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 
 export function EquipmentListScreen() {
   const params = useLocalSearchParams<{ gymId?: string }>();
@@ -245,6 +244,7 @@ export function EquipmentDetailScreen() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [permissionBlocked, setPermissionBlocked] = useState(false);
 
   const load = useCallback(async () => {
     if (!account) {
@@ -271,6 +271,15 @@ export function EquipmentDetailScreen() {
   useFocusEffect(
     useCallback(() => {
       void load();
+      const subscription = AppState.addEventListener('change', (state) => {
+        if (state === 'active') {
+          // Recheck on the next capture rather than assuming Settings granted access.
+          setPermissionBlocked(false);
+          setError(null);
+          void load();
+        }
+      });
+      return () => subscription.remove();
     }, [load]),
   );
 
@@ -278,72 +287,80 @@ export function EquipmentDetailScreen() {
     if (!account || !equipment) {
       return;
     }
-    const permission =
-      source === 'camera'
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      setError(
-        source === 'camera'
-          ? 'Permita a câmera para fotografar a máquina.'
-          : 'Permita o acesso às fotos para continuar.',
-      );
-      return;
-    }
-    const launched =
-      source === 'camera'
-        ? await ImagePicker.launchCameraAsync({
-            mediaTypes: ['images'],
-            quality: 0.7,
-            base64: true,
-          })
-        : await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ['images'],
-            quality: 0.7,
-            base64: true,
-          });
-    if (launched.canceled || !launched.assets[0]?.base64) {
-      return;
-    }
-    const asset = launched.assets[0];
-    const dataBase64 = asset?.base64;
-    if (!dataBase64) {
-      return;
-    }
-    const contentType =
-      asset.mimeType === 'image/png'
-        ? 'image/png'
-        : asset.mimeType === 'image/webp'
-          ? 'image/webp'
-          : 'image/jpeg';
-    if (asset.mimeType && !['image/jpeg', 'image/png', 'image/webp'].includes(asset.mimeType)) {
-      setError('Use uma imagem JPEG, PNG ou WebP.');
-      return;
-    }
-    const bytes = Math.floor((dataBase64.length * 3) / 4);
-    if (bytes > MAX_PHOTO_BYTES) {
-      setError('A imagem precisa ter até 5 MB. Escolha outra ou deixe a câmera comprimir.');
-      return;
-    }
+    if (busy) return;
     setBusy(true);
-    setError(null);
+    setMessage(null);
     try {
-      await saveEquipmentPhoto(
-        account.id,
-        params.gymId,
-        equipment.id,
-        contentType,
-        dataBase64,
-        online,
-      );
-      setMessage(
-        online ? 'Foto salva.' : 'Foto guardada neste aparelho. Ela sobe quando a conexão voltar.',
-      );
-      await load();
-    } catch (caught) {
-      setError(
-        caught instanceof ApiClientError ? caught.message : 'Não foi possível salvar a foto.',
-      );
+      const permission =
+        source === 'camera'
+          ? await ImagePicker.requestCameraPermissionsAsync()
+          : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (photoPermissionAction(permission) !== 'capture') {
+        setPermissionBlocked(photoPermissionAction(permission) === 'settings');
+        setError(
+          source === 'camera'
+            ? 'Permita a câmera para fotografar a máquina.'
+            : 'Permita o acesso às fotos para continuar.',
+        );
+        return;
+      }
+      setPermissionBlocked(false);
+      const launched =
+        source === 'camera'
+          ? await ImagePicker.launchCameraAsync({
+              mediaTypes: ['images'],
+              quality: 0.7,
+              base64: true,
+            })
+          : await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ['images'],
+              quality: 0.7,
+              base64: true,
+            });
+      if (launched.canceled || !launched.assets[0]?.base64) {
+        return;
+      }
+      const asset = launched.assets[0];
+      const dataBase64 = asset?.base64;
+      if (!dataBase64) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      try {
+        const { contentType, dataBase64 } = prepareEquipmentPhoto(asset);
+        // Verify that native image decoding succeeds before preserving the payload.
+        await new Promise<void>((resolve, reject) =>
+          Image.getSize(
+            `data:${contentType};base64,${dataBase64}`,
+            () => resolve(),
+            () => reject(new Error('A imagem está corrompida ou não pode ser exibida.')),
+          ),
+        );
+        await saveEquipmentPhoto(
+          account.id,
+          params.gymId,
+          equipment.id,
+          contentType,
+          dataBase64,
+          online,
+        );
+        const saved = await readLocalEquipment(account.id, equipment.id);
+        setMessage(
+          saved?.photoPending
+            ? 'Foto salva neste aparelho. Envio pendente; use Sincronizar quando houver conexão.'
+            : 'Foto enviada ao servidor e salva neste aparelho.',
+        );
+        await load();
+      } catch (caught) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : 'Não foi possível salvar a foto. A pendência local foi preservada.',
+        );
+      } finally {
+        await load().catch(() => undefined);
+      }
     } finally {
       setBusy(false);
     }
@@ -394,6 +411,7 @@ export function EquipmentDetailScreen() {
         <Image
           accessibilityLabel={`Foto de ${equipment.name}`}
           source={{ uri: equipment.photoUri }}
+          onError={() => setError('Não foi possível exibir esta imagem. Escolha outra foto.')}
           style={{ width: '100%', height: 220, borderRadius: 16 }}
         />
       ) : (
@@ -413,6 +431,20 @@ export function EquipmentDetailScreen() {
       />
       {message ? <Notice tone="success" message={message} /> : null}
       {error ? <Notice tone="error" message={error} /> : null}
+      {permissionBlocked ? (
+        <Button
+          label="Abrir configurações de permissão"
+          variant="secondary"
+          onPress={() =>
+            void Linking.openSettings().catch(() =>
+              setError('Abra os Ajustes do aparelho e permita câmera ou fotos para MeuTreino+.'),
+            )
+          }
+        />
+      ) : null}
+      {equipment.photoPending ? (
+        <Notice message="Foto com alteração local pendente de envio." />
+      ) : null}
       {!equipment.photoUri && equipment.hasPhoto ? (
         <Button
           label="Baixar foto"
@@ -441,7 +473,15 @@ export function EquipmentDetailScreen() {
         title="Fotos do equipamento"
         detail="Uma referência visual para encontrar a máquina."
       />
-      <Button label="Escolher foto" busy={busy} onPress={() => void pick('library')} />
+      <Button
+        label="Escolher foto"
+        busy={busy}
+        onPress={() =>
+          void pick('library').catch(() =>
+            setError('Não foi possível abrir suas fotos. Verifique a permissão nos Ajustes.'),
+          )
+        }
+      />
       <Button
         label="Tirar foto"
         variant="secondary"

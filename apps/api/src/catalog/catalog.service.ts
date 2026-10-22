@@ -225,13 +225,34 @@ export class CatalogService {
     contentType: 'image/jpeg' | 'image/png' | 'image/webp',
     dataBase64: string,
   ): Promise<void> {
-    const current = await this.ownedEquipment(userId, gymId, equipmentId);
-    const bytes = decodeImage(dataBase64, contentType);
+    await this.ownedEquipment(userId, gymId, equipmentId);
+    const bytes = await decodeImage(dataBase64, contentType);
     const assetId = crypto.randomUUID();
     const storageKey = `${userId}/equipment/${assetId}`;
-    await this.storage.put(storageKey, bytes);
+    let written = false;
+    let previousKey: string | null = null;
     try {
       await this.prisma.$transaction(async (tx) => {
+        // The row lock serializes competing replacements and retries without changing sync contracts.
+        await tx.$queryRaw`SELECT id FROM meutreino.equipment WHERE id = ${equipmentId}::uuid FOR UPDATE`;
+        const current = await tx.equipment.findUnique({
+          where: { id: equipmentId },
+          include: { photo: true, gym: true },
+        });
+        if (!current || current.gymId !== gymId || current.gym.ownerUserId !== userId) {
+          throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Equipamento não encontrado.');
+        }
+        if (
+          current.photo &&
+          !current.photo.deletedAt &&
+          current.photo.ownerUserId === userId &&
+          current.photo.contentType === contentType
+        ) {
+          const existing = await this.storage.read(current.photo.storageKey);
+          if (existing.equals(bytes)) return;
+        }
+        written = true;
+        await this.storage.put(storageKey, bytes);
         await tx.mediaAsset.create({
           data: {
             id: assetId,
@@ -251,16 +272,20 @@ export class CatalogService {
             where: { id: current.photoAssetId },
             data: { deletedAt: new Date() },
           });
+          previousKey = current.photo?.storageKey ?? null;
         }
       });
     } catch (error) {
-      await this.storage.remove(storageKey);
+      if (written) await this.storage.remove(storageKey);
       throw error;
     }
-    if (current.photo?.storageKey) {
-      await this.storage.remove(current.photo.storageKey);
-    }
-    await this.audit.record({ userId, eventType: 'equipment_photo_replaced', outcome: 'success' });
+    if (previousKey) await this.storage.remove(previousKey);
+    if (written)
+      await this.audit.record({
+        userId,
+        eventType: 'equipment_photo_replaced',
+        outcome: 'success',
+      });
   }
 
   async readEquipmentPhoto(
@@ -277,23 +302,31 @@ export class CatalogService {
   }
 
   async deleteEquipmentPhoto(userId: string, gymId: string, equipmentId: string): Promise<void> {
-    const equipment = await this.ownedEquipment(userId, gymId, equipmentId);
-    if (!equipment.photo) {
-      return;
-    }
-    const storageKey = equipment.photo.storageKey;
-    await this.prisma.$transaction([
-      this.prisma.equipment.update({
+    await this.ownedEquipment(userId, gymId, equipmentId);
+    const storageKey = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM meutreino.equipment WHERE id = ${equipmentId}::uuid FOR UPDATE`;
+      const equipment = await tx.equipment.findUnique({
+        where: { id: equipmentId },
+        include: { photo: true },
+      });
+      if (!equipment || equipment.userId !== userId || equipment.gymId !== gymId) {
+        throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Equipamento não encontrado.');
+      }
+      if (!equipment.photo) return null;
+      await tx.equipment.update({
         where: { id: equipmentId },
         data: { photoAssetId: null, version: { increment: 1 } },
-      }),
-      this.prisma.mediaAsset.update({
+      });
+      await tx.mediaAsset.update({
         where: { id: equipment.photo.id },
         data: { deletedAt: new Date() },
-      }),
-    ]);
-    await this.storage.remove(storageKey);
-    await this.audit.record({ userId, eventType: 'equipment_photo_removed', outcome: 'success' });
+      });
+      return equipment.photo.storageKey;
+    });
+    if (storageKey) {
+      await this.storage.remove(storageKey);
+      await this.audit.record({ userId, eventType: 'equipment_photo_removed', outcome: 'success' });
+    }
   }
 
   async listExercises(userId: string, query: ExerciseQuery) {

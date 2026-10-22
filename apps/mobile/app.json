@@ -45,8 +45,8 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "O MeuTreino+ usa a foto escolhida apenas como foto do seu perfil.",
-          "cameraPermission": "O MeuTreino+ usa a câmera apenas se você quiser fotografar seu perfil."
+          "photosPermission": "O MeuTreino+ acessa as fotos escolhidas por você para seu perfil e seus equipamentos.",
+          "cameraPermission": "O MeuTreino+ usa a câmera quando você escolhe fotografar seus equipamentos."
         }
       ]
     ],

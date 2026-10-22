@@ -16,7 +16,11 @@ import {
   readRefreshToken,
   saveLastUserId,
 } from '@/security/secure-store';
-import { localCleanupPlan, planSessionBootstrap } from '@/session/session-policy';
+import {
+  cachedOfflineAccount,
+  localCleanupPlan,
+  planSessionBootstrap,
+} from '@/session/session-policy';
 import { clearAccessToken } from '@/session/token-memory';
 import { useThemeStore } from '@/state/theme-store';
 
@@ -55,7 +59,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (!(error instanceof ApiClientError) || error.status !== 401) {
         const userId = await readLastUserId();
         const account = userId ? await readCachedAccount(userId).catch(() => null) : null;
-        set({ status: 'offline', account });
+        set({
+          status: 'offline',
+          account: cachedOfflineAccount(refreshToken, userId, account, error),
+        });
         return;
       }
       set({ status: 'anonymous', account: null });

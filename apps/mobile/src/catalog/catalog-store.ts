@@ -42,7 +42,7 @@ export type SyncReport = { synced: boolean; conflicts: number };
 export async function countPendingOperations(userId: string): Promise<number> {
   const database = await openLocalDatabase(userId);
   const row = await database.getFirstAsync<{ pending: number }>(
-    `SELECT COUNT(*) AS pending FROM sync_queue WHERE status IN ('pending', 'error', 'in_flight')`,
+    `SELECT (SELECT COUNT(*) FROM sync_queue WHERE status IN ('pending', 'error', 'in_flight')) + (SELECT COUNT(*) FROM equipment WHERE photo_pending <> 0) AS pending`,
   );
   return row?.pending ?? 0;
 }
@@ -138,7 +138,7 @@ export async function listLocalEquipment(userId: string, gymId?: string): Promis
 export async function readLocalEquipment(
   userId: string,
   equipmentId: string,
-): Promise<(EquipmentView & { photoUri: string | null }) | null> {
+): Promise<(EquipmentView & { photoUri: string | null; photoPending: boolean }) | null> {
   const database = await openLocalDatabase(userId);
   const row = await database.getFirstAsync<EquipmentRow>(
     `SELECT * FROM equipment WHERE id = ?`,
@@ -147,7 +147,7 @@ export async function readLocalEquipment(
   if (!row) {
     return null;
   }
-  return { ...mapEquipment(row), photoUri: photoUri(row) };
+  return { ...mapEquipment(row), photoUri: photoUri(row), photoPending: row.photo_pending !== 0 };
 }
 
 export async function saveEquipment(
@@ -201,30 +201,21 @@ export async function saveEquipmentPhoto(
   online: boolean,
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
-  if (online) {
-    try {
-      await uploadEquipmentPhotoRequest(gymId, equipmentId, contentType, dataBase64);
-      await database.runAsync(
-        `UPDATE equipment SET has_photo = 1, photo_base64 = ?, photo_content_type = ?, photo_pending = 0, updated_at = ? WHERE id = ?`,
-        dataBase64,
-        contentType,
-        new Date().toISOString(),
-        equipmentId,
-      );
-      return;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
+  const current = await database.getFirstAsync<EquipmentRow>(
+    `SELECT * FROM equipment WHERE id = ? AND gym_id = ?`,
+    equipmentId,
+    gymId,
+  );
+  if (!current) throw new Error('Equipamento não encontrado.');
   await database.runAsync(
-    `UPDATE equipment SET has_photo = 1, photo_base64 = ?, photo_content_type = ?, photo_pending = 1, updated_at = ? WHERE id = ?`,
+    `UPDATE equipment SET has_photo = 1, photo_base64 = ?, photo_content_type = ?, photo_pending = 1, updated_at = ? WHERE id = ? AND gym_id = ?`,
     dataBase64,
     contentType,
     new Date().toISOString(),
     equipmentId,
+    gymId,
   );
+  if (online) await syncCatalog(userId);
 }
 
 export async function cacheDownloadedPhoto(
@@ -238,7 +229,7 @@ export async function cacheDownloadedPhoto(
   }
   const database = await openLocalDatabase(userId);
   await database.runAsync(
-    `UPDATE equipment SET has_photo = 1, photo_content_type = ?, photo_base64 = ?, photo_pending = 0 WHERE id = ?`,
+    `UPDATE equipment SET has_photo = 1, photo_content_type = ?, photo_base64 = ?, photo_pending = 0 WHERE id = ? AND photo_pending = 0`,
     match[1],
     match[2],
     equipmentId,
@@ -259,31 +250,12 @@ export async function removeEquipmentPhoto(
   if (!current) {
     return;
   }
-  if (current.photo_pending === 1 || !current.has_photo) {
-    await database.runAsync(
-      `UPDATE equipment SET has_photo = 0, photo_base64 = NULL, photo_content_type = NULL, photo_pending = 0 WHERE id = ?`,
-      equipmentId,
-    );
-    return;
-  }
-  if (online) {
-    try {
-      await deleteEquipmentPhotoRequest(gymId, equipmentId);
-      await database.runAsync(
-        `UPDATE equipment SET has_photo = 0, photo_base64 = NULL, photo_content_type = NULL, photo_pending = 0 WHERE id = ?`,
-        equipmentId,
-      );
-      return;
-    } catch (error) {
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-  }
+  // A pending upload may already exist remotely if its ACK was lost.
   await database.runAsync(
     `UPDATE equipment SET has_photo = 0, photo_base64 = NULL, photo_content_type = NULL, photo_pending = 2 WHERE id = ?`,
     equipmentId,
   );
+  if (online) await syncCatalog(userId);
 }
 
 export async function listLocalExercises(
@@ -441,7 +413,7 @@ async function runCatalogSync(userId: string): Promise<SyncReport> {
     }
     await releaseOperations(database, queued);
     await refreshSnapshot(database);
-    await flushPhotos(database);
+    if (await flushPhotos(database)) await refreshSnapshot(database);
   } catch (error) {
     await releaseOperations(database, queued);
     if (isNetworkError(error)) return { synced: false, conflicts };
@@ -472,7 +444,7 @@ async function refreshSnapshot(database: Database): Promise<void> {
         ) {
           // Deletion is conditional on BOTH local and remote versions captured before the GET.
           await tx.runAsync(
-            `DELETE FROM ${syncTable(type)} WHERE id = ? AND local_revision = ? AND version = ? AND pending = 0`,
+            `DELETE FROM ${syncTable(type)} WHERE id = ? AND local_revision = ? AND version = ? AND pending = 0${type === 'equipment' ? ' AND photo_pending = 0' : ''}`,
             id,
             state.local_revision,
             state.version,
@@ -557,7 +529,7 @@ async function saveCatalogRevision(
   await enqueue(db, type, view.id, current?.version || null, catalogPayload(type, view), next);
 }
 
-async function flushPhotos(database: Database): Promise<void> {
+async function flushPhotos(database: Database): Promise<boolean> {
   const uploads = await database.getAllAsync<EquipmentRow>(
     `SELECT * FROM equipment WHERE photo_pending = 1 AND pending = 0 AND synced = 1 AND photo_base64 IS NOT NULL AND photo_content_type IS NOT NULL`,
   );
@@ -567,8 +539,10 @@ async function flushPhotos(database: Database): Promise<void> {
     }
     await uploadEquipmentPhotoRequest(row.gym_id, row.id, row.photo_content_type, row.photo_base64);
     await database.runAsync(
-      `UPDATE equipment SET photo_pending = 0, has_photo = 1 WHERE id = ?`,
+      `UPDATE equipment SET photo_pending = 0, has_photo = 1 WHERE id = ? AND photo_pending = 1 AND photo_base64 = ? AND photo_content_type = ?`,
       row.id,
+      row.photo_base64,
+      row.photo_content_type,
     );
   }
   const removals = await database.getAllAsync<EquipmentRow>(
@@ -577,10 +551,11 @@ async function flushPhotos(database: Database): Promise<void> {
   for (const row of removals) {
     await deleteEquipmentPhotoRequest(row.gym_id, row.id);
     await database.runAsync(
-      `UPDATE equipment SET photo_pending = 0, has_photo = 0 WHERE id = ?`,
+      `UPDATE equipment SET photo_pending = 0, has_photo = 0 WHERE id = ? AND photo_pending = 2`,
       row.id,
     );
   }
+  return uploads.length + removals.length > 0;
 }
 
 async function enqueue(

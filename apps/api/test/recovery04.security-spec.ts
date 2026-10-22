@@ -86,7 +86,7 @@ function guard() {
 describe('Recovery 04 transaction, terminal state and offline origin invariants', () => {
   let app: NestExpressApplication;
   let db: PrismaService;
-  beforeAll(async () => {
+  async function startApp() {
     guard();
     const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = module.createNestApplication<NestExpressApplication>();
@@ -96,7 +96,8 @@ describe('Recovery 04 transaction, terminal state and offline origin invariants'
     expect(
       (await db.$queryRaw<{ name: string }[]>`SELECT current_database() AS name`)[0]!.name,
     ).toBe(process.env.EXPECTED_DATABASE);
-  });
+  }
+  beforeAll(startApp);
   afterAll(async () => {
     await app?.close();
   });
@@ -1069,118 +1070,197 @@ describe('Recovery 04 transaction, terminal state and offline origin invariants'
     expect(await db.planReconciliation.count({ where: { userId: s.f.userId } })).toBe(0);
     expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(1);
   });
-  it('Recovery 04.2 REAL SQLite + HTTP + PostgreSQL: lost decision ACK, restart, immutable B and one Q/E', async () => {
-    const s = await reconcileFixture();
-    await post(
-      s.f.token,
-      `/workout-sessions/${s.f.payload.id}/finish`,
-      { confirmIncomplete: true },
-      200,
-    );
-    const { harness } = createRequire(__filename)(
-      '../../mobile/test/support/sqlite-harness.cjs',
-    ) as { harness: () => Promise<MobileHarness> };
-    const h = await harness();
-    try {
-      // Keep local identities tied to the actual user-owned plan and exercise IDs.
-      const dbLocal = (
-        h as unknown as { db: { runAsync: (sql: string, ...args: unknown[]) => Promise<unknown> } }
-      ).db;
-      await dbLocal.runAsync('DELETE FROM plans');
-      await dbLocal.runAsync(
-        "INSERT INTO plans(id,name,description,accent,status,version,payload,updated_at,pending,synced) VALUES(?, ?,NULL,NULL,'active',?,?,?,0,1)",
-        s.f.payload.planId,
-        'Official',
-        s.f.payload.planVersion,
-        JSON.stringify(s.f.payload.planSnapshot),
-        new Date().toISOString(),
-      );
-      const plans = h.load('plans/plan-store') as ReturnType<MobileHarness['load']> & {
-        syncPlans: (user: string) => Promise<unknown>;
-        reconcileLocalPlanConflict: (
-          user: string,
-          id: string,
-          choice: string,
-          desc: string,
-          source: string,
-        ) => Promise<void>;
-      };
-      await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
-        p.name = 'Offline A';
-      });
-      await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
-        p.name = 'Offline B';
-      });
-      const api = h.api as unknown as Record<string, (...args: never[]) => Promise<unknown>>;
-      api.pushCatalogSync = (async (operations: unknown[]) =>
-        (await post(s.f.token, '/sync', { operations }, 201)).body) as typeof api.pushCatalogSync;
-      api.listPlansRequest = (async () => ({ items: [], total: 0 })) as typeof api.listPlansRequest;
-      api.getPlanRequest = (async (id: string) =>
-        (
-          await request(server())
-            .get(`/api/v1/workout-plans/${id}`)
-            .set('Authorization', `Bearer ${s.f.token}`)
-            .expect(200)
-        ).body) as typeof api.getPlanRequest;
-      await plans.syncPlans(h.user);
-      const rows = await (
-        h as unknown as {
-          db: { getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>> };
-        }
-      ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
-      let lost = true;
-      api.reconcilePlanConflictRequest = (async (id: string, body: object) => {
-        const response = await post(
+  describe('isolated historical ACK integration', () => {
+    // Keep the real throttler enabled; this workload has its own HTTP rate budget.
+    beforeAll(async () => {
+      await app.close();
+      await startApp();
+    });
+    it.each(['none', 'pending', 'published'] as const)(
+      'Recovery 04.2 REAL SQLite + HTTP + PostgreSQL: lost ACK with %s F, restart and one Q/E',
+      async (successor) => {
+        const s = await reconcileFixture();
+        await post(
           s.f.token,
-          `/workout-plan-conflicts/${id}/reconcile`,
-          body,
+          `/workout-sessions/${s.f.payload.id}/finish`,
+          { confirmIncomplete: true },
           200,
         );
-        if (lost) {
-          lost = false;
-          throw new h.errors.ApiClientError('lost ACK', 0, 'network_error');
+        const { harness } = createRequire(__filename)(
+          '../../mobile/test/support/sqlite-harness.cjs',
+        ) as { harness: () => Promise<MobileHarness> };
+        const h = await harness();
+        try {
+          // Keep local identities tied to the actual user-owned plan and exercise IDs.
+          const dbLocal = (
+            h as unknown as {
+              db: { runAsync: (sql: string, ...args: unknown[]) => Promise<unknown> };
+            }
+          ).db;
+          await dbLocal.runAsync('DELETE FROM plans');
+          await dbLocal.runAsync(
+            "INSERT INTO plans(id,name,description,accent,status,version,payload,updated_at,pending,synced) VALUES(?, ?,NULL,NULL,'active',?,?,?,0,1)",
+            s.f.payload.planId,
+            'Official',
+            s.f.payload.planVersion,
+            JSON.stringify(s.f.payload.planSnapshot),
+            new Date().toISOString(),
+          );
+          const plans = h.load('plans/plan-store') as ReturnType<MobileHarness['load']> & {
+            syncPlans: (user: string) => Promise<unknown>;
+            reconcileLocalPlanConflict: (
+              user: string,
+              id: string,
+              choice: string,
+              desc: string,
+              source: string,
+            ) => Promise<void>;
+          };
+          await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
+            p.name = 'Offline A';
+          });
+          await plans.updateLocalPlan(h.user, s.f.payload.planId, (p) => {
+            p.name = 'Offline B';
+          });
+          const api = h.api as unknown as Record<string, (...args: never[]) => Promise<unknown>>;
+          api.pushCatalogSync = (async (operations: unknown[]) =>
+            (await post(s.f.token, '/sync', { operations }, 201))
+              .body) as typeof api.pushCatalogSync;
+          api.listPlansRequest = (async () =>
+            (
+              await request(server())
+                .get('/api/v1/workout-plans?page=1&pageSize=50&includeArchived=true')
+                .set('Authorization', `Bearer ${s.f.token}`)
+                .expect(200)
+            ).body) as typeof api.listPlansRequest;
+          api.getPlanRequest = (async (id: string) =>
+            (
+              await request(server())
+                .get(`/api/v1/workout-plans/${id}`)
+                .set('Authorization', `Bearer ${s.f.token}`)
+                .expect(200)
+            ).body) as typeof api.getPlanRequest;
+          await plans.syncPlans(h.user);
+          const rows = await (
+            h as unknown as {
+              db: {
+                getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>>;
+              };
+            }
+          ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
+          let lost = true;
+          api.reconcilePlanConflictRequest = (async (id: string, body: object) => {
+            const response = await post(
+              s.f.token,
+              `/workout-plan-conflicts/${id}/reconcile`,
+              body,
+              200,
+            );
+            if (lost) {
+              lost = false;
+              throw new h.errors.ApiClientError('lost ACK', 0, 'network_error');
+            }
+            return response.body;
+          }) as typeof api.reconcilePlanConflictRequest;
+          await expect(
+            plans.reconcileLocalPlanConflict(
+              h.user,
+              s.f.payload.planId,
+              'keep_both',
+              'reapply',
+              rows[1]!.id,
+            ),
+          ).rejects.toThrow('Retomar');
+          const remoteDecision = await db.planReconciliation.findFirstOrThrow({
+            where: { userId: s.f.userId },
+          });
+          const confirmed = remoteDecision.result as unknown as {
+            preservedPlan: { id: string; version: number };
+          };
+          const qid = confirmed.preservedPlan.id;
+          const queryLocal = () =>
+            (
+              h as unknown as {
+                db: {
+                  getAllAsync: (sql: string) => Promise<
+                    Array<{
+                      id: string;
+                      name: string;
+                      version: number;
+                      pending: number;
+                      local_revision: number;
+                      acknowledged_revision: number;
+                      origin_revision_id: string | null;
+                    }>
+                  >;
+                };
+              }
+            ).db;
+          let liveBefore:
+            Awaited<ReturnType<ReturnType<typeof queryLocal>['getAllAsync']>>[number] | undefined;
+          if (successor !== 'none') {
+            await plans.syncPlans(h.user); // Real HTTP list discovers Q before the lost ACK is retried.
+            await plans.updateLocalPlan(h.user, qid, (p) => {
+              p.name = 'F before decision ACK';
+            });
+            if (successor === 'published') await plans.syncPlans(h.user);
+            liveBefore = (await queryLocal().getAllAsync('SELECT * FROM plans')).find(
+              (row) => row.id === qid,
+            );
+            expect(liveBefore?.pending).toBe(successor === 'pending' ? 1 : 0);
+          }
+          await h.reopen();
+          const reopened = h.load('plans/plan-store') as typeof plans;
+          await reopened.reconcileLocalPlanConflict(
+            h.user,
+            s.f.payload.planId,
+            'keep_both',
+            'reapply',
+            rows[1]!.id,
+          );
+          const after = await (
+            h as unknown as {
+              db: {
+                getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>>;
+              };
+            }
+          ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
+          expect(after.slice(0, 2).map((r) => r.snapshot)).toEqual(rows.map((r) => r.snapshot));
+          expect(after).toHaveLength(successor === 'none' ? 3 : 4);
+          if (liveBefore) {
+            const liveAfter = (await queryLocal().getAllAsync('SELECT * FROM plans')).find(
+              (row) => row.id === qid,
+            )!;
+            for (const key of [
+              'name',
+              'version',
+              'pending',
+              'local_revision',
+              'acknowledged_revision',
+              'origin_revision_id',
+            ] as const)
+              expect(liveAfter[key]).toEqual(liveBefore[key]);
+            expect(liveAfter.name).toBe('F before decision ACK');
+            if (successor === 'published')
+              expect(liveAfter.version).toBeGreaterThan(confirmed.preservedPlan.version);
+          }
+          expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(2);
+          const decisions = await db.planReconciliation.findMany({ where: { userId: s.f.userId } });
+          expect(decisions).toHaveLength(1);
+          const result = decisions[0]!.result as unknown as { preservedPlan: { id: string } };
+          await reopened.updateLocalPlan(h.user, result.preservedPlan.id, (p) => {
+            p.name = 'Edit after recovery';
+          });
+          await reopened.syncPlans(h.user);
+          expect(
+            (await db.workoutPlan.findUniqueOrThrow({ where: { id: result.preservedPlan.id } }))
+              .name,
+          ).toBe('Edit after recovery');
+        } finally {
+          await h.close();
         }
-        return response.body;
-      }) as typeof api.reconcilePlanConflictRequest;
-      await expect(
-        plans.reconcileLocalPlanConflict(
-          h.user,
-          s.f.payload.planId,
-          'keep_both',
-          'reapply',
-          rows[1]!.id,
-        ),
-      ).rejects.toThrow('Retomar');
-      await h.reopen();
-      const reopened = h.load('plans/plan-store') as typeof plans;
-      await reopened.reconcileLocalPlanConflict(
-        h.user,
-        s.f.payload.planId,
-        'keep_both',
-        'reapply',
-        rows[1]!.id,
-      );
-      const after = await (
-        h as unknown as {
-          db: { getAllAsync: (sql: string) => Promise<Array<{ id: string; snapshot: string }>> };
-        }
-      ).db.getAllAsync('SELECT * FROM local_plan_revisions ORDER BY rowid');
-      expect(after.slice(0, 2).map((r) => r.snapshot)).toEqual(rows.map((r) => r.snapshot));
-      expect(after).toHaveLength(3);
-      expect(await db.workoutPlan.count({ where: { ownerUserId: s.f.userId } })).toBe(2);
-      const decisions = await db.planReconciliation.findMany({ where: { userId: s.f.userId } });
-      expect(decisions).toHaveLength(1);
-      const result = decisions[0]!.result as unknown as { preservedPlan: { id: string } };
-      await reopened.updateLocalPlan(h.user, result.preservedPlan.id, (p) => {
-        p.name = 'Edit after recovery';
-      });
-      await reopened.syncPlans(h.user);
-      expect(
-        (await db.workoutPlan.findUniqueOrThrow({ where: { id: result.preservedPlan.id } })).name,
-      ).toBe('Edit after recovery');
-    } finally {
-      await h.close();
-    }
+      },
+    );
   });
   it('Recovery 04.2 decision insertion failure rolls back Q, E, closures and all plan changes', async () => {
     const s = await reconcileFixture();

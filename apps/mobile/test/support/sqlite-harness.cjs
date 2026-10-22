@@ -61,6 +61,7 @@ function adapter(filename, controls = {}) {
 async function harness(
   directory = mkdtempSync(path.join(os.tmpdir(), 'meutreino-recovery02-')),
   legacy = false,
+  dependencies = {},
 ) {
   const user = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -267,6 +268,7 @@ async function harness(
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
       }).outputText;
       const requireModule = (name) => {
+        if (Object.hasOwn(dependencies, name)) return dependencies[name];
         if (name === 'zod') return require('zod');
         if (name === '@meutreino/shared') return shared;
         if (name === 'expo-crypto')

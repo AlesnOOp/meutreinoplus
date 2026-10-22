@@ -8,11 +8,16 @@ import { useSessionStore } from '@/session/session-store';
 import { Button, Card, Disclosure, Field, Icon, Notice, Screen, usePalette } from '@/ui/ui';
 
 export default function VerifyEmailScreen() {
+  const params = useLocalSearchParams<{ token?: string; email?: string }>();
+  // A new mail link starts a new form even when this route was already mounted.
+  return <VerifyEmailForm key={params.token ?? params.email ?? 'manual'} params={params} />;
+}
+
+function VerifyEmailForm({ params }: { params: { token?: string; email?: string } }) {
   const { palette } = usePalette();
   const account = useSessionStore((state) => state.account);
   const setAccount = useSessionStore((state) => state.setAccount);
   const [verified, setVerified] = useState(false);
-  const params = useLocalSearchParams<{ token?: string; email?: string }>();
   const [token, setToken] = useState(typeof params.token === 'string' ? params.token : '');
   const [email, setEmail] = useState(typeof params.email === 'string' ? params.email : '');
   const [busy, setBusy] = useState(false);

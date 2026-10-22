@@ -6,6 +6,7 @@ import { Button, Notice, Screen, usePalette } from '@/ui/ui';
 export default function IndexScreen() {
   const status = useSessionStore((state) => state.status);
   const bootstrap = useSessionStore((state) => state.bootstrap);
+  const account = useSessionStore((state) => state.account);
   const { palette } = usePalette();
 
   if (status === 'booting') {
@@ -22,14 +23,14 @@ export default function IndexScreen() {
       </View>
     );
   }
-  if (status === 'authenticated') {
+  if (status === 'authenticated' || (status === 'offline' && account)) {
     return <Redirect href="/home" />;
   }
   if (status === 'offline') {
     return (
       <Screen
         title="Sem conexão"
-        subtitle="A sessão continua neste aparelho, mas a API não respondeu."
+        subtitle="Não foi possível recuperar uma conta validada neste aparelho."
       >
         <Notice message="Tente de novo quando a rede voltar. Seus dados locais não foram apagados." />
         <Button label="Tentar novamente" onPress={() => void bootstrap()} />
