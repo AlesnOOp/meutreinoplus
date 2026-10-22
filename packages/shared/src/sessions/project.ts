@@ -92,6 +92,7 @@ export function projectClock(
       endedAt: payload.endedAt,
       events: payload.timeEvents
         .filter((event) => event.kind === 'pause' || event.kind === 'resume')
+        .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))
         .map((event) => ({ kind: event.kind as 'pause' | 'resume', occurredAt: event.occurredAt })),
       now,
     }),
@@ -104,7 +105,7 @@ export function projectClock(
 }
 
 export function projectRest(events: readonly SessionTimeEvent[], now: string): RestView | null {
-  const ordered = [...events];
+  const ordered = [...events].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
   let current: {
     startedAt: string;
     durationSeconds: number;

@@ -1,8 +1,15 @@
 import {
   openSessionSchema,
+  conflictPreviewSchema,
+  sessionResolutionSchema,
+  sessionVariantsSchema,
+  sessionConflictPreviewSchema,
+  sessionConflictResolveSchema,
   sessionResponseSchema,
+  sessionPageSchema,
   type SessionSyncPayload,
 } from '@meutreino/shared';
+import { z } from 'zod';
 import { apiRequest } from '@/api/client';
 import { pushCatalogSync } from '@/api/catalog';
 
@@ -33,14 +40,26 @@ export function getSessionRequest(sessionId: string) {
   return send(`/api/v1/workout-sessions/${sessionId}`, sessionResponseSchema);
 }
 
+export function previewSessionConflictRequest(
+  conflictId: string,
+  body: z.infer<typeof sessionConflictPreviewSchema>,
+) {
+  return send(`/api/v1/workout-session-conflicts/${conflictId}/preview`, conflictPreviewSchema, {
+    method: 'POST',
+    body,
+  });
+}
 export function resolveSessionConflictRequest(
   conflictId: string,
-  choice: 'keep_server' | 'keep_local' | 'keep_both',
+  body: z.infer<typeof sessionConflictResolveSchema>,
 ) {
-  return send(`/api/v1/workout-session-conflicts/${conflictId}/resolve`, sessionResponseSchema, {
+  return send(`/api/v1/workout-session-conflicts/${conflictId}/resolve`, sessionResolutionSchema, {
     method: 'POST',
-    body: { choice },
+    body,
   });
+}
+export function sessionVariantsRequest(sessionId: string) {
+  return send(`/api/v1/workout-sessions/${sessionId}/variants`, sessionVariantsSchema);
 }
 
 export function pushSessionSync(operations: unknown[]) {
@@ -48,3 +67,7 @@ export function pushSessionSync(operations: unknown[]) {
 }
 
 export type { SessionSyncPayload };
+
+export function listSessionPageRequest(page: number) {
+  return send(`/api/v1/workout-sessions?page=${page}&pageSize=50`, sessionPageSchema);
+}

@@ -182,6 +182,26 @@ async function harness(
     }),
     getSessionRequest: async (id) => copies(sessions.get(id)),
     openSessionRequest: async () => ({ session: null }),
+    listSessionPageRequest: async () => ({ items: [], page: 1, pageSize: 50, total: 0 }),
+    previewSessionConflictRequest: async (_id, body) => ({
+      choice: body.choice === 'keep_server' ? 'keep_remote' : body.choice,
+      remoteVersion: sessions.get(body.payload.id).version,
+      localRevision: body.localRevision,
+      previewHash: 'a'.repeat(64),
+      changes: shared.sessionDifferences(sessions.get(body.payload.id).payload, body.payload),
+      containsExecution: body.payload.performedSets.length > 0,
+      canApplyLocal: true,
+      reason: null,
+    }),
+    resolveSessionConflictRequest: async (_id, body) => ({
+      ...copies(sessions.get(body.payload.id)),
+      resolution: {
+        id: body.idempotencyKey,
+        choice: body.choice,
+        localRevision: body.localRevision,
+      },
+    }),
+    sessionVariantsRequest: async () => [],
   };
   const controls = {};
   function runtime() {
@@ -196,6 +216,7 @@ async function harness(
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
       }).outputText;
       const requireModule = (name) => {
+        if (name === 'zod') return require('zod');
         if (name === '@meutreino/shared') return shared;
         if (name === 'expo-crypto')
           return {
@@ -237,6 +258,7 @@ async function harness(
           WeakMap,
           Promise,
           JSON,
+          structuredClone,
         },
         { filename },
       );

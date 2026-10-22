@@ -245,3 +245,6 @@ export { decideLocalLogout } from './sync/logout-policy';
 export type { LocalDataDecision, LocalLogoutReason } from './sync/logout-policy';
 export { syncOperationEnvelopeSchema } from './sync/operation';
 export type { SyncOperationEnvelope } from './sync/operation';
+
+export { sessionConflictPreviewSchema } from './sessions/contracts';
+export * from './sessions/resolution';

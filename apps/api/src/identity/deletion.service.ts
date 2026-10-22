@@ -13,6 +13,9 @@ const APPEND_ONLY_TABLES = [
   'audit_logs',
   'workout_plan_revisions',
   'session_time_events',
+  'workout_session_resolutions',
+  'workout_session_variants',
+  'exercise_feedback_revisions',
 ] as const;
 
 const PURGE_GUARDED_TABLES = [...APPEND_ONLY_TABLES, 'exercise_sessions'] as const;
@@ -56,6 +59,9 @@ export class DeletionService {
           });
           const exerciseSessionIds = exerciseSessions.map((session) => session.id);
           await tx.sessionTimeEvent.deleteMany({ where: { workoutSessionId: { in: sessionIds } } });
+          await tx.workoutSessionVariant.deleteMany({ where: { resolution: { userId } } });
+          await tx.workoutSessionResolution.deleteMany({ where: { userId } });
+          await tx.exerciseFeedbackRevision.deleteMany({ where: { feedback: { userId } } });
           await tx.workoutSessionConflict.deleteMany({ where: { userId } });
           await tx.performedSetCorrection.deleteMany({
             where: {

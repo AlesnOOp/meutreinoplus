@@ -170,7 +170,7 @@ export async function acknowledge(db: SQLiteDatabase, sent: QueuedRevision): Pro
       sent.idempotency_key,
       sent.local_revision,
     );
-    if (!operation || operation.status === 'done') return;
+    if (!operation || ['done', 'superseded'].includes(operation.status)) return;
     await tx.runAsync(
       `UPDATE sync_queue SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`,
       new Date().toISOString(),

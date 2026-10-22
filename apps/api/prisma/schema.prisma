@@ -345,13 +345,13 @@ enum SyncOperationStatus {
 }
 
 model User {
-  id           String     @id @default(uuid()) @db.Uuid
-  email        String?    @unique @db.Citext
-  passwordHash String?    @map("password_hash")
-  status       UserStatus @default(active)
-  locale       String     @default("pt-BR") @db.VarChar(35)
-  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id                String     @id @default(uuid()) @db.Uuid
+  email             String?    @unique @db.Citext
+  passwordHash      String?    @map("password_hash")
+  status            UserStatus @default(active)
+  locale            String     @default("pt-BR") @db.VarChar(35)
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
   deletedAt         DateTime?  @map("deleted_at") @db.Timestamptz(3)
   emailVerifiedAt   DateTime?  @map("email_verified_at") @db.Timestamptz(3)
   passwordChangedAt DateTime?  @map("password_changed_at") @db.Timestamptz(3)
@@ -362,26 +362,27 @@ model User {
   consents            ConsentRecord[]
   deletionRequests    AccountDeletionRequest[]
   exportRequests      DataExportRequest[]
-  ownedGyms           Gym[]                       @relation("GymOwner")
+  ownedGyms           Gym[]                      @relation("GymOwner")
   gymMemberships      UserGym[]
   mediaAssets         MediaAsset[]
   equipment           Equipment[]
-  customExercises     Exercise[]                  @relation("ExerciseOwner")
-  ownedPlans          WorkoutPlan[]               @relation("PlanOwner")
-  authoredPlans       WorkoutPlan[]               @relation("PlanAuthor")
+  customExercises     Exercise[]                 @relation("ExerciseOwner")
+  ownedPlans          WorkoutPlan[]              @relation("PlanOwner")
+  authoredPlans       WorkoutPlan[]              @relation("PlanAuthor")
   schedules           WeeklySchedule[]
   workoutSessions     WorkoutSession[]
+  sessionResolutions  WorkoutSessionResolution[]
   feedback            ExerciseFeedback[]
   professionalProfile ProfessionalProfile?
-  studentLinks        StudentProfessionalLink[]   @relation("StudentLinks")
-  professionalLinks   StudentProfessionalLink[]   @relation("ProfessionalLinks")
-  invitedLinks        StudentProfessionalLink[]   @relation("LinkInviter")
+  studentLinks        StudentProfessionalLink[]  @relation("StudentLinks")
+  professionalLinks   StudentProfessionalLink[]  @relation("ProfessionalLinks")
+  invitedLinks        StudentProfessionalLink[]  @relation("LinkInviter")
   subscriptions       Subscription[]
   devices             Device[]
   syncOperations      SyncOperation[]
   planConflicts       WorkoutPlanConflict[]
   sessionConflicts    WorkoutSessionConflict[]
-  auditLogs           AuditLog[]                  @relation("AuditActor")
+  auditLogs           AuditLog[]                 @relation("AuditActor")
   setCorrections      PerformedSetCorrection[]
   emailVerifications  EmailVerificationToken[]
   passwordResets      PasswordResetToken[]
@@ -844,11 +845,13 @@ model WorkoutSession {
   createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user        User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
-  workoutPlan WorkoutPlan?             @relation(fields: [workoutPlanId], references: [id], onDelete: Restrict)
-  gym         Gym?                     @relation(fields: [gymId], references: [id], onDelete: Restrict)
+  user        User                       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  workoutPlan WorkoutPlan?               @relation(fields: [workoutPlanId], references: [id], onDelete: Restrict)
+  gym         Gym?                       @relation(fields: [gymId], references: [id], onDelete: Restrict)
   exercises   ExerciseSession[]
   timeEvents  SessionTimeEvent[]
+  resolutions WorkoutSessionResolution[]
+  variants    WorkoutSessionVariant[]
   conflicts   WorkoutSessionConflict[]
 
   @@index([userId, startedAt])
@@ -886,6 +889,8 @@ model WorkoutSessionConflict {
 
   user           User           @relation(fields: [userId], references: [id], onDelete: Restrict)
   workoutSession WorkoutSession @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+
+  resolution WorkoutSessionResolution?
 
   @@index([userId, status])
   @@map("workout_session_conflicts")
@@ -984,8 +989,9 @@ model ExerciseFeedback {
   createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  exerciseSession ExerciseSession @relation(fields: [exerciseSessionId], references: [id], onDelete: Restrict)
-  user            User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  exerciseSession ExerciseSession            @relation(fields: [exerciseSessionId], references: [id], onDelete: Restrict)
+  user            User                       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  revisions       ExerciseFeedbackRevision[]
 
   @@index([userId])
   @@map("exercise_feedback")
@@ -1221,5 +1227,55 @@ model SecurityAuditEvent {
   @@index([userId, createdAt])
   @@index([eventType, createdAt])
   @@map("security_audit_events")
+  @@schema("meutreino")
+}
+
+model WorkoutSessionResolution {
+  id               String                  @id @db.Uuid
+  userId           String                  @map("user_id") @db.Uuid
+  conflictId       String                  @unique @map("conflict_id") @db.Uuid
+  workoutSessionId String                  @map("workout_session_id") @db.Uuid
+  choice           String                  @db.Text
+  localRevision    Int                     @map("local_revision")
+  expectedVersion  Int                     @map("expected_version")
+  requestHash      String                  @map("request_hash") @db.VarChar(64)
+  result           Json
+  createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+  user             User                    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  conflict         WorkoutSessionConflict  @relation(fields: [conflictId], references: [id], onDelete: Restrict)
+  workoutSession   WorkoutSession          @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+  variants         WorkoutSessionVariant[]
+
+  @@index([userId])
+  @@map("workout_session_resolutions")
+  @@schema("meutreino")
+}
+
+model WorkoutSessionVariant {
+  id               String                   @id @db.Uuid
+  resolutionId     String                   @map("resolution_id") @db.Uuid
+  workoutSessionId String                   @map("workout_session_id") @db.Uuid
+  origin           String                   @db.Text
+  sourceRevision   Int                      @map("source_revision")
+  payload          Json
+  createdAt        DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  resolution       WorkoutSessionResolution @relation(fields: [resolutionId], references: [id], onDelete: Restrict)
+  workoutSession   WorkoutSession           @relation(fields: [workoutSessionId], references: [id], onDelete: Restrict)
+
+  @@unique([resolutionId, origin])
+  @@index([workoutSessionId])
+  @@map("workout_session_variants")
+  @@schema("meutreino")
+}
+
+model ExerciseFeedbackRevision {
+  feedbackId String           @map("feedback_id") @db.Uuid
+  version    Int
+  payload    Json
+  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  feedback   ExerciseFeedback @relation(fields: [feedbackId], references: [id], onDelete: Restrict)
+
+  @@id([feedbackId, version])
+  @@map("exercise_feedback_revisions")
   @@schema("meutreino")
 }

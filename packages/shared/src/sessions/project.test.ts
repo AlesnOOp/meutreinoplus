@@ -219,4 +219,20 @@ describe('session projection', () => {
   it('asks for confirmation while a planned set has no completed result', () => {
     expect(hasUnfinishedPlannedSets(payload())).toBe(true);
   });
+  it('projects clocks from event chronology after merging events received in reverse order', () => {
+    const pause = {
+      id: '10000000-0000-4000-8000-000000000990',
+      kind: 'pause' as const,
+      occurredAt: '2026-10-20T12:00:20.000Z',
+      restDurationSeconds: null,
+      exerciseSessionId: null,
+    };
+    const resume = {
+      ...pause,
+      id: '10000000-0000-4000-8000-000000000991',
+      kind: 'resume' as const,
+      occurredAt: '2026-10-20T12:01:00.000Z',
+    };
+    expect(projectClock(payload({ timeEvents: [resume, pause] }), now).activeSeconds).toBe(80);
+  });
 });

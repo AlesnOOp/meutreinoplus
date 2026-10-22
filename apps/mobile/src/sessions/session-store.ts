@@ -1,17 +1,24 @@
 import {
   canonicalJsonString,
+  rebaseSessionEdits,
+  sessionResolutionSchema,
+  sessionConflictResolveSchema,
   effectiveSet,
   sessionPlanSnapshotSchema,
   sessionSyncPayloadSchema,
   type SessionSyncPayload,
 } from '@meutreino/shared';
+import { z } from 'zod';
 import * as Crypto from 'expo-crypto';
 import { ApiClientError, isNetworkError } from '@/api/errors';
 import {
   getSessionRequest,
+  listSessionPageRequest,
   openSessionRequest,
   pushSessionSync,
   resolveSessionConflictRequest,
+  previewSessionConflictRequest,
+  sessionVariantsRequest,
   startSessionRequest,
 } from '@/api/sessions';
 import { openLocalDatabase } from '@/db/local-database';
@@ -326,6 +333,7 @@ export async function saveLocalFeedback(
     session.feedback.push({
       id: Crypto.randomUUID(),
       exerciseSessionId,
+      version: 0,
       perceivedLevel: input.perceivedLevel,
       comment: input.comment,
     });
@@ -379,6 +387,12 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
     throw error;
   });
   const database = await openLocalDatabase(userId);
+  try {
+    await retrySessionResolutions(userId);
+  } catch (error) {
+    if (isNetworkError(error)) return { synced: false, conflicts: plans.conflicts };
+    throw error;
+  }
   await adoptSyncedPlans(userId, database);
   const queued = await claimOperations(database, ['workout_session']);
   let conflicts = plans.conflicts;
@@ -405,6 +419,7 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
           await acknowledge(database, row);
           const beforeGet = await revision(database, 'workout_session', row.entity_id);
           const remote = await getSessionRequest(row.entity_id).catch(() => null);
+          if (remote) await reconcileFeedbackVersions(database, remote.payload);
           if (remote)
             await applyRemoteSession(
               userId,
@@ -415,6 +430,12 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
         } else {
           conflicts += item.status === 'conflict' ? 1 : 0;
           await localTransaction(database, async (tx) => {
+            const active = await tx.getFirstAsync<{ status: string }>(
+              'SELECT status FROM sync_queue WHERE id = ? AND idempotency_key = ?',
+              row.id,
+              row.idempotency_key,
+            );
+            if (!active || active.status === 'superseded' || active.status === 'done') return;
             await tx.runAsync(
               `UPDATE sync_queue SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`,
               item.code ?? item.status,
@@ -441,6 +462,7 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
         remote.session.version,
         captured.get(remote.session.payload.id)?.local_revision ?? 0,
       );
+    await restoreSessionHistory(userId, database, captured);
   } catch (error) {
     await releaseOperations(database, queued);
     if (isNetworkError(error)) return { synced: false, conflicts };
@@ -454,43 +476,283 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
   };
 }
 
+/** Restore existing completed sessions after logout erased the device DB. Never replace dirty rows. */
+async function restoreSessionHistory(
+  userId: string,
+  database: Database,
+  captured: Awaited<ReturnType<typeof captureRevisions>>,
+) {
+  for (let page = 1; ; page++) {
+    const result = await listSessionPageRequest(page);
+    for (const item of result.items) {
+      const current = await database.getFirstAsync<SessionRow>(
+        'SELECT * FROM sessions WHERE id = ?',
+        item.id,
+      );
+      if (
+        current &&
+        (current.pending || current.conflict_operation_id || current.server_version >= item.version)
+      )
+        continue;
+      const remote = await getSessionRequest(item.id);
+      await applyRemoteSession(
+        userId,
+        remote.payload,
+        remote.version,
+        captured.get(item.id)?.local_revision ?? 0,
+      );
+    }
+    if (page * result.pageSize >= result.total || result.items.length === 0) break;
+  }
+}
+
+type ResolutionChoice = 'keep_remote' | 'keep_server' | 'keep_local' | 'keep_both';
+type ResolutionIntent = {
+  id: string;
+  session_id: string;
+  conflict_id: string;
+  local_revision: number;
+  request: string;
+  status: string;
+};
+export async function previewLocalSessionConflict(
+  userId: string,
+  sessionId: string,
+  choice: ResolutionChoice,
+) {
+  const database = await openLocalDatabase(userId);
+  const row = await database.getFirstAsync<SessionRow>(
+    'SELECT * FROM sessions WHERE id = ?',
+    sessionId,
+  );
+  if (!row?.conflict_operation_id) throw new Error('Conflito não encontrado.');
+  const payload = sessionSyncPayloadSchema.parse(JSON.parse(row.payload));
+  let preview: Awaited<ReturnType<typeof previewSessionConflictRequest>>;
+  try {
+    preview = await previewSessionConflictRequest(row.conflict_operation_id, {
+      choice,
+      localRevision: row.local_revision,
+      payload,
+    });
+  } catch (error) {
+    if (error instanceof ApiClientError && error.code === 'conflict_already_resolved')
+      await requeueClosedConflict(database, row.id, row.conflict_operation_id, row.server_version);
+    throw error;
+  }
+  return { preview, payload, conflictId: row.conflict_operation_id };
+}
+
 export async function resolveLocalSessionConflict(
   userId: string,
   sessionId: string,
-  choice: 'keep_server' | 'keep_local' | 'keep_both',
-): Promise<void> {
-  const current = await readLocalSession(userId, sessionId);
-  if (!current?.conflictOperationId) {
+  choice: ResolutionChoice,
+  decision?: Awaited<ReturnType<typeof previewLocalSessionConflict>>,
+) {
+  const database = await openLocalDatabase(userId);
+  const previous = await database.getFirstAsync<ResolutionIntent>(
+    "SELECT * FROM session_resolution_intents WHERE session_id = ? AND status = 'pending'",
+    sessionId,
+  );
+  if (previous) {
+    await sendResolutionIntent(userId, previous);
     return;
   }
-  const database = await openLocalDatabase(userId);
-  const captured = await revision(database, 'workout_session', sessionId);
-  const remote = await resolveSessionConflictRequest(current.conflictOperationId, choice);
+  const reviewed = decision ?? (await previewLocalSessionConflict(userId, sessionId, choice));
+  if (
+    (choice === 'keep_remote' || choice === 'keep_server') &&
+    reviewed.preview.changes.length &&
+    !decision
+  )
+    throw new Error('Revise as diferenças e confirme, ou preserve ambas as versões.');
+  const request = sessionConflictResolveSchema.parse({
+    choice,
+    payload: reviewed.payload,
+    localRevision: reviewed.preview.localRevision,
+    expectedVersion: reviewed.preview.remoteVersion,
+    previewHash: reviewed.preview.previewHash,
+    idempotencyKey: Crypto.randomUUID(),
+    confirmDiscard: !!decision,
+  });
+  const intent: ResolutionIntent = {
+    id: request.idempotencyKey,
+    session_id: sessionId,
+    conflict_id: reviewed.conflictId,
+    local_revision: request.localRevision,
+    request: JSON.stringify(request),
+    status: 'pending',
+  };
   await localTransaction(database, async (tx) => {
-    const latest = await revision(tx, 'workout_session', sessionId);
-    if ((latest?.local_revision ?? 0) !== (captured?.local_revision ?? 0)) {
-      await tx.runAsync(
-        `UPDATE sessions SET stale_remote_version = ? WHERE id = ?`,
-        remote.version,
-        sessionId,
-      );
-      return; // Preserve the explicit conflict state and all subsequent local edits (Achado 04).
+    const row = await tx.getFirstAsync<SessionRow>(
+      'SELECT * FROM sessions WHERE id = ?',
+      sessionId,
+    );
+    if (
+      row?.conflict_operation_id !== intent.conflict_id ||
+      row.local_revision !== intent.local_revision
+    )
+      throw new Error('O treino mudou durante a revisão. Revise novamente.');
+    await tx.runAsync(
+      "INSERT INTO session_resolution_intents(id,session_id,conflict_id,local_revision,request,status,created_at) VALUES(?,?,?,?,?,'pending',?)",
+      intent.id,
+      sessionId,
+      intent.conflict_id,
+      intent.local_revision,
+      intent.request,
+      new Date().toISOString(),
+    );
+  });
+  await sendResolutionIntent(userId, intent);
+}
+
+async function sendResolutionIntent(userId: string, intent: ResolutionIntent) {
+  const database = await openLocalDatabase(userId);
+  const request = sessionConflictResolveSchema.parse(JSON.parse(intent.request));
+  let remote: z.infer<typeof sessionResolutionSchema>;
+  try {
+    remote = await resolveSessionConflictRequest(intent.conflict_id, request);
+  } catch (error) {
+    if (
+      error instanceof ApiClientError &&
+      [
+        'resolution_stale',
+        'conflict_already_resolved',
+        'incompatible_session',
+        'idempotency_key_reused',
+        'confirmation_required',
+      ].includes(error.code)
+    ) {
+      await localTransaction(database, async (tx) => {
+        await tx.runAsync(
+          "UPDATE session_resolution_intents SET status = 'requires_review', result = ? WHERE id = ? AND status = 'pending'",
+          JSON.stringify({ code: error.code, message: error.message }),
+          intent.id,
+        );
+        if (error.code === 'conflict_already_resolved') {
+          await requeueClosedConflictInTransaction(
+            tx,
+            intent.session_id,
+            intent.conflict_id,
+            request.expectedVersion,
+          );
+        }
+      });
     }
-    await writeSession(
-      tx,
-      remote.payload,
-      remote.version,
-      false,
-      latest?.local_revision ?? 0,
-      null,
+    throw error;
+  }
+  // A committed server decision is acknowledged once; later local edits are a separate operation.
+  await localTransaction(database, async (tx) => {
+    const saved = await tx.getFirstAsync<ResolutionIntent>(
+      'SELECT * FROM session_resolution_intents WHERE id = ?',
+      intent.id,
+    );
+    if (saved?.status !== 'pending') return;
+    const latest = await tx.getFirstAsync<SessionRow>(
+      'SELECT * FROM sessions WHERE id = ?',
+      intent.session_id,
+    );
+    if (!latest) throw new Error('Treino local não encontrado.');
+    await tx.runAsync(
+      "UPDATE session_resolution_intents SET status = 'applied', result = ? WHERE id = ?",
+      JSON.stringify(remote),
+      intent.id,
     );
     await tx.runAsync(
-      `UPDATE sync_queue SET status = 'done', updated_at = ? WHERE id = ?`,
+      "UPDATE sync_queue SET status = 'superseded', updated_at = ? WHERE entity_type = 'workout_session' AND entity_id = ? AND status <> 'done'",
       new Date().toISOString(),
-      current.conflictOperationId,
+      intent.session_id,
     );
-    await tx.runAsync(`UPDATE sessions SET conflict_operation_id = NULL WHERE id = ?`, sessionId);
+    if (latest.local_revision === intent.local_revision) {
+      await writeSession(tx, remote.payload, remote.version, false, latest.local_revision, null);
+    } else {
+      const newer = sessionSyncPayloadSchema.parse(JSON.parse(latest.payload));
+      const rebased = rebaseSessionEdits(request.payload, newer, remote.payload);
+      const payload = rebased ?? newer;
+      await writeSession(tx, payload, remote.version, true, latest.local_revision, null);
+      // Unsafe rebase gets an explicitly stale base, forcing a NEW conflict without losing the newer payload.
+      await enqueueSession(
+        tx,
+        payload,
+        rebased ? remote.version : request.expectedVersion,
+        latest.local_revision,
+      );
+    }
+    await tx.runAsync(
+      'UPDATE sessions SET acknowledged_revision = MAX(acknowledged_revision, ?), conflict_operation_id = NULL WHERE id = ?',
+      intent.local_revision,
+      intent.session_id,
+    );
   });
+  await refreshSessionVariants(userId, intent.session_id).catch(() => undefined);
+}
+
+async function requeueClosedConflict(
+  database: Database,
+  sessionId: string,
+  conflictId: string,
+  base: number,
+) {
+  await localTransaction(database, (tx) =>
+    requeueClosedConflictInTransaction(tx, sessionId, conflictId, base),
+  );
+}
+async function requeueClosedConflictInTransaction(
+  tx: Database,
+  sessionId: string,
+  conflictId: string,
+  base: number,
+) {
+  const latest = await tx.getFirstAsync<SessionRow>(
+    'SELECT * FROM sessions WHERE id = ?',
+    sessionId,
+  );
+  if (latest?.conflict_operation_id !== conflictId) return;
+  await tx.runAsync(
+    "UPDATE sync_queue SET status = 'superseded', updated_at = ? WHERE entity_type = 'workout_session' AND entity_id = ? AND status <> 'done'",
+    new Date().toISOString(),
+    sessionId,
+  );
+  await enqueueSession(
+    tx,
+    sessionSyncPayloadSchema.parse(JSON.parse(latest.payload)),
+    base,
+    latest.local_revision,
+  );
+  await tx.runAsync(
+    'UPDATE sessions SET conflict_operation_id = NULL, pending = 1, synced = 0 WHERE id = ?',
+    sessionId,
+  );
+}
+
+export async function retrySessionResolutions(userId: string) {
+  const database = await openLocalDatabase(userId);
+  const intents = await database.getAllAsync<ResolutionIntent>(
+    "SELECT * FROM session_resolution_intents WHERE status = 'pending' ORDER BY created_at",
+  );
+  for (const intent of intents) await sendResolutionIntent(userId, intent);
+}
+export async function refreshSessionVariants(userId: string, sessionId: string) {
+  const rows = await sessionVariantsRequest(sessionId);
+  const database = await openLocalDatabase(userId);
+  await localTransaction(database, async (tx) => {
+    for (const row of rows)
+      await tx.runAsync(
+        'INSERT INTO session_variants(id,session_id,payload) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING',
+        row.id,
+        sessionId,
+        JSON.stringify(row),
+      );
+  });
+  return rows;
+}
+export async function readSessionVariants(userId: string, sessionId: string) {
+  const database = await openLocalDatabase(userId);
+  const rows = await database.getAllAsync<{ payload: string }>(
+    'SELECT payload FROM session_variants WHERE session_id = ? ORDER BY rowid',
+    sessionId,
+  );
+  return rows.map(
+    (row) => JSON.parse(row.payload) as Awaited<ReturnType<typeof sessionVariantsRequest>>[number],
+  );
 }
 
 export function visibleSets(session: SessionSyncPayload, exerciseSessionId: string) {
@@ -626,6 +888,47 @@ async function applyRemoteSession(
     if (!(await canApplyRemote(tx, 'workout_session', payload.id, expectedRevision, serverVersion)))
       return;
     await writeSession(tx, payload, serverVersion, false, expectedRevision, null);
+  });
+}
+
+async function reconcileFeedbackVersions(database: Database, remote: SessionSyncPayload) {
+  await localTransaction(database, async (tx) => {
+    const update = (payload: SessionSyncPayload) => {
+      for (const item of payload.feedback) {
+        const stored = remote.feedback.find(
+          (row) => row.id === item.id && row.exerciseSessionId === item.exerciseSessionId,
+        );
+        if (stored && item.version < stored.version) item.version = stored.version;
+      }
+      return payload;
+    };
+    const row = await tx.getFirstAsync<SessionRow>(
+      'SELECT * FROM sessions WHERE id = ?',
+      remote.id,
+    );
+    if (!row || row.conflict_operation_id) return;
+    await tx.runAsync(
+      'UPDATE sessions SET payload = ? WHERE id = ?',
+      JSON.stringify(update(sessionSyncPayloadSchema.parse(JSON.parse(row.payload)))),
+      remote.id,
+    );
+    const queued = await tx.getAllAsync<{ id: string; payload: string }>(
+      "SELECT id,payload FROM sync_queue WHERE entity_type = 'workout_session' AND entity_id = ? AND status = 'pending' AND attempt_count = 0",
+      remote.id,
+    );
+    for (const operation of queued) {
+      const payload = update(sessionSyncPayloadSchema.parse(JSON.parse(operation.payload)));
+      const hash = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        canonicalJsonString(payload),
+      );
+      await tx.runAsync(
+        'UPDATE sync_queue SET payload = ?, payload_hash = ? WHERE id = ?',
+        JSON.stringify(payload),
+        hash,
+        operation.id,
+      );
+    }
   });
 }
 

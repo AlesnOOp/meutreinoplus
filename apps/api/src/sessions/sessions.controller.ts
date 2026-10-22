@@ -19,6 +19,7 @@ import {
   performedSetWriteSchema,
   restActionSchema,
   sessionConflictResolveSchema,
+  sessionConflictPreviewSchema,
   sessionMomentSchema,
   skipExerciseSchema,
   startSessionSchema,
@@ -78,6 +79,14 @@ export class WorkoutSessionController {
     @Param('sessionId', new ZodValidationPipe(uuidSchema)) sessionId: string,
   ) {
     return this.sessions.get(requireAuth(request).userId, sessionId);
+  }
+
+  @Get(':sessionId/variants')
+  variants(
+    @Req() request: AuthenticatedRequest,
+    @Param('sessionId', new ZodValidationPipe(uuidSchema)) sessionId: string,
+  ) {
+    return this.sessions.variants(requireAuth(request).userId, sessionId);
   }
 
   @Get(':sessionId/summary')
@@ -248,6 +257,17 @@ export class WorkoutSessionController {
 export class WorkoutSessionConflictController {
   constructor(private readonly sessions: SessionsService) {}
 
+  @Post(':conflictId/preview')
+  @HttpCode(200)
+  preview(
+    @Req() request: AuthenticatedRequest,
+    @Param('conflictId', new ZodValidationPipe(uuidSchema)) conflictId: string,
+    @Body(new ZodValidationPipe(sessionConflictPreviewSchema))
+    body: z.infer<typeof sessionConflictPreviewSchema>,
+  ) {
+    return this.sessions.previewConflict(requireAuth(request).userId, conflictId, body);
+  }
+
   @Post(':conflictId/resolve')
   @HttpCode(200)
   @ApiOperation({ summary: 'Reconcilia um conflito sem apagar séries realizadas.' })
@@ -257,6 +277,6 @@ export class WorkoutSessionConflictController {
     @Body(new ZodValidationPipe(sessionConflictResolveSchema))
     body: z.infer<typeof sessionConflictResolveSchema>,
   ) {
-    return this.sessions.resolveConflict(requireAuth(request).userId, conflictId, body.choice);
+    return this.sessions.resolveConflict(requireAuth(request).userId, conflictId, body);
   }
 }

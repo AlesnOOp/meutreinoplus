@@ -42,6 +42,9 @@ import {
   readOpenLocalSession,
   recordLocalSet,
   resolveLocalSessionConflict,
+  previewLocalSessionConflict,
+  readSessionVariants,
+  refreshSessionVariants,
   saveLocalFeedback,
   startLocalSession,
   syncSessions,
@@ -257,33 +260,13 @@ export function SessionScreen() {
         <Notice message="Há registros deste treino ainda não sincronizados." />
       ) : null}
       {session.conflictOperationId ? (
-        <View style={{ gap: 8 }}>
-          <Notice
-            tone="error"
-            message="Este treino divergiu de outro aparelho. Escolha o que preservar. Nenhuma série é apagada."
-          />
-          <Button
-            label="Manter este aparelho"
-            onPress={() =>
-              void resolveLocalSessionConflict(account.id, session.id, 'keep_local').then(reload)
-            }
-          />
-          <Button
-            label="Manter os dois"
-            variant="secondary"
-            onPress={() =>
-              void resolveLocalSessionConflict(account.id, session.id, 'keep_both').then(reload)
-            }
-          />
-          <Button
-            label="Usar o servidor"
-            variant="secondary"
-            onPress={() =>
-              void resolveLocalSessionConflict(account.id, session.id, 'keep_server').then(reload)
-            }
-          />
-        </View>
+        <SessionConflictActions userId={account.id} sessionId={session.id} onResolved={reload} />
       ) : null}
+      <SessionVariantHistory
+        userId={account.id}
+        sessionId={session.id}
+        revision={session.serverVersion}
+      />
       <WorkoutClock
         value={formatClock(clock.activeSeconds)}
         detail={session.gymName ?? 'Seu treino, no seu ritmo'}
@@ -784,6 +767,13 @@ export function SessionSummaryScreen() {
       <Notice
         message={`${summary.plannedSets} séries planejadas · ${summary.skippedExercises} exercícios pulados`}
       />
+      {account ? (
+        <SessionVariantHistory
+          userId={account.id}
+          sessionId={session.id}
+          revision={session.serverVersion}
+        />
+      ) : null}
       <Section title="O que ficou registrado" />
       {summary.loads.map((item) => (
         <Text key={`${item.exerciseName}-${item.setIndex}`}>
@@ -834,5 +824,189 @@ function WorkoutClock({
       </Text>
       <Text style={{ color: palette.muted, fontSize: 13, textAlign: 'center' }}>{detail}</Text>
     </Card>
+  );
+}
+
+function SessionConflictActions({
+  userId,
+  sessionId,
+  onResolved,
+}: {
+  userId: string;
+  sessionId: string;
+  onResolved: () => Promise<void>;
+}) {
+  const [decision, setDecision] = useState<Awaited<
+    ReturnType<typeof previewLocalSessionConflict>
+  > | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const preview = async (choice: 'keep_remote' | 'keep_local' | 'keep_both') => {
+    setBusy(true);
+    setError(null);
+    try {
+      setDecision(await previewLocalSessionConflict(userId, sessionId, choice));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Não foi possível revisar o conflito.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card>
+      <Notice
+        tone="error"
+        message="Este treino divergiu de outro aparelho. Revise as diferenças antes de decidir."
+      />
+      {error ? <Notice tone="error" message={error} /> : null}
+      {decision ? (
+        <>
+          <Text>
+            {decision.preview.choice === 'keep_both'
+              ? 'As versões deste aparelho e a sincronizada ficarão no histórico. O treino principal permanece sincronizado, sem duplicar estatísticas.'
+              : decision.preview.choice === 'keep_local'
+                ? 'As alterações deste aparelho serão reconciliadas. Registros confirmados permanecem preservados.'
+                : 'A versão sincronizada será o treino principal. As diferenças abaixo ficarão apenas na cópia de recuperação.'}
+          </Text>
+          {decision.preview.changes.map((change, index) => (
+            <Text key={index}>{change}</Text>
+          ))}
+          {decision.preview.reason ? <Notice message={decision.preview.reason} /> : null}
+          {decision.preview.containsExecution ? (
+            <Notice message="Há séries executadas nestas diferenças. Use Manter ambas para preservar as duas representações acessíveis." />
+          ) : null}
+          <Button
+            label={
+              decision.preview.choice === 'keep_remote'
+                ? 'Confirmar uso da versão sincronizada'
+                : 'Confirmar decisão'
+            }
+            busy={busy}
+            disabled={decision.preview.choice === 'keep_local' && !decision.preview.canApplyLocal}
+            onPress={() => {
+              setBusy(true);
+              void resolveLocalSessionConflict(userId, sessionId, decision.preview.choice, decision)
+                .then(async () => {
+                  setDecision(null);
+                  await onResolved();
+                })
+                .catch((error) =>
+                  setError(
+                    error instanceof Error
+                      ? error.message
+                      : 'Falha ao resolver. A decisão está salva para nova tentativa.',
+                  ),
+                )
+                .finally(() => setBusy(false));
+            }}
+          />
+        </>
+      ) : null}
+      <Button
+        label="Revisar este aparelho"
+        busy={busy}
+        onPress={() => void preview('keep_local')}
+      />
+      <Button
+        label="Manter ambas as versões"
+        variant="secondary"
+        busy={busy}
+        onPress={() => void preview('keep_both')}
+      />
+      <Button
+        label="Revisar versão sincronizada"
+        variant="secondary"
+        busy={busy}
+        onPress={() => void preview('keep_remote')}
+      />
+    </Card>
+  );
+}
+
+function SessionVariantHistory({
+  userId,
+  sessionId,
+  revision,
+}: {
+  userId: string;
+  sessionId: string;
+  revision: number;
+}) {
+  const [rows, setRows] = useState<Awaited<ReturnType<typeof readSessionVariants>>>([]);
+  useEffect(() => {
+    let active = true;
+    void readSessionVariants(userId, sessionId).then((rows) => {
+      if (active) setRows(rows);
+    });
+    void refreshSessionVariants(userId, sessionId)
+      .then((rows) => {
+        if (active) setRows(rows);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [userId, sessionId, revision]);
+  if (!rows.length) return null;
+  return (
+    <Disclosure title="Versões preservadas e cópias de recuperação">
+      <Notice message="Cópias históricas desta mesma execução. Não são treinos adicionais e não entram novamente nas estatísticas." />
+      {rows.map((row) => (
+        <Disclosure
+          key={row.id}
+          title={`${row.origin === 'local' ? 'Este aparelho' : 'Versão sincronizada'} · revisão ${row.sourceRevision} · ${new Date(row.createdAt).toLocaleString('pt-BR')}`}
+        >
+          <Text>
+            {row.choice === 'keep_both'
+              ? 'Versão alternativa preservada'
+              : row.choice === 'keep_remote' && row.origin === 'local'
+                ? 'Cópia de recuperação: não aplicada ao treino principal'
+                : row.origin === 'remote' && row.choice === 'keep_local'
+                  ? 'Versão sincronizada anterior à decisão'
+                  : 'Origem da versão escolhida'}
+          </Text>
+          <Text>{`${row.payload.planSnapshot.name} · ficha revisão ${row.payload.planVersion}`}</Text>
+          <Text>{`${SESSION_STATUS_LABELS_PT[row.payload.status]} · início ${new Date(row.payload.startedAt).toLocaleString('pt-BR')}${row.payload.endedAt ? ` · fim ${new Date(row.payload.endedAt).toLocaleString('pt-BR')}` : ''}`}</Text>
+          <Text>{row.payload.notes ?? 'Sem observações'}</Text>
+          {row.payload.exerciseSessions.map((exercise) => (
+            <View key={exercise.id}>
+              <Text>{`${exercise.name} · ${exercise.status === 'skipped' ? `Pulado: ${exercise.skipReason ?? ''}` : exercise.status === 'completed' ? 'Concluído' : 'Pendente/em andamento'}`}</Text>
+              <Text>{`${exercise.gymName ?? 'Sem academia'} · ${exercise.equipmentName ?? 'Sem equipamento'} ${exercise.machineNumber ?? ''}`}</Text>
+              {row.payload.planSnapshot.exercises
+                .find((planned) => planned.id === exercise.planExerciseId)
+                ?.sets.map((planned) => (
+                  <Text
+                    key={planned.id}
+                  >{`Planejada ${planned.setIndex}: ${planned.repetitions ?? '—'} repetições · ${planned.load ?? 'sem carga'} ${planned.loadUnit ?? ''}`}</Text>
+                ))}
+              {row.payload.performedSets
+                .filter((set) => set.exerciseSessionId === exercise.id)
+                .map((set) => (
+                  <Text
+                    key={set.id}
+                  >{`Registro original ${set.setIndex} (${set.outcome === 'skipped' ? 'pulado' : 'realizado'}): ${set.repetitions ?? '—'} repetições · ${set.load ?? 'sem carga'} ${set.loadUnit ?? ''} · ${set.notes ?? ''}`}</Text>
+                ))}
+              {row.payload.feedback
+                .filter((feedback) => feedback.exerciseSessionId === exercise.id)
+                .map((feedback) => (
+                  <Text
+                    key={feedback.id}
+                  >{`Avaliação ${feedback.perceivedLevel ?? '—'} · ${feedback.comment ?? ''}`}</Text>
+                ))}
+            </View>
+          ))}
+          {row.payload.corrections.map((correction) => (
+            <Text
+              key={correction.id}
+            >{`Correção da série ${row.payload.performedSets.find((set) => set.id === correction.performedSetId)?.setIndex ?? '—'}: ${correction.voided ? 'Anulada' : `${correction.repetitions ?? '—'} repetições · ${correction.load ?? 'sem carga'} ${correction.loadUnit ?? ''}`} · ${correction.reason}`}</Text>
+          ))}
+          {row.payload.timeEvents.map((event) => (
+            <Text
+              key={event.id}
+            >{`${{ pause: 'Pausa', resume: 'Retomada', rest_start: 'Início do descanso', rest_pause: 'Pausa do descanso', rest_resume: 'Retomada do descanso', rest_finish: 'Fim do descanso' }[event.kind]} · ${new Date(event.occurredAt).toLocaleString('pt-BR')}`}</Text>
+          ))}
+        </Disclosure>
+      ))}
+    </Disclosure>
   );
 }

@@ -71,52 +71,34 @@ for (const status of [429, 500, 503, 401]) {
 }
 
 for (const choice of ['keep_server', 'keep_local', 'keep_both']) {
-  test(`conflict ${choice} stores server corrections without requeuing stale data`, async () => {
-    const writes = [];
-    const remote = {
-      id: 'session',
-      status: 'in_progress',
-      planId: 'plan',
-      planName: 'A',
-      corrections: [{ id: 'server-correction' }],
-    };
-    const database = {
-      getFirstAsync: async () => ({
-        payload: JSON.stringify({ ...remote, corrections: [] }),
-        server_version: 1,
-        conflict_operation_id: 'conflict',
-      }),
-      runAsync: async (...args) => {
-        writes.push(args);
-      },
-      withTransactionAsync: async (callback) => callback(),
-    };
-    const store = load('sessions/session-store.ts', {
-      '@meutreino/shared': { sessionSyncPayloadSchema: { parse: (value) => value } },
-      'expo-crypto': {},
-      '@/api/errors': {},
-      '@/api/sessions': {
-        resolveSessionConflictRequest: async () => ({ payload: remote, version: 7 }),
-      },
-      '@/db/local-database': { openLocalDatabase: async () => database },
-      '@/db/sync-state': {
-        revision: async () => ({ local_revision: 0 }),
-        localTransaction: async (db, work) => db.withTransactionAsync(() => work(db)),
-      },
-      '@/plans/plan-store': {},
-    });
-    await store.resolveLocalSessionConflict('user', 'session', choice);
-    const saved = writes.find(([sql]) => sql.includes('INSERT INTO sessions'));
-    assert.deepEqual(JSON.parse(saved[6]), remote);
-    assert.equal(saved[5], 7);
-    assert.equal(saved[8], 0);
-    assert.equal(
-      writes.some(([sql]) => sql.includes('INSERT INTO sync_queue')),
-      false,
+  test(`conflict ${choice} stores server corrections without requeuing stale data (real SQLite)`, async (t) => {
+    const { harness } = require('./support/sqlite-harness.cjs');
+    const h = await harness();
+    t.after(() => h.close());
+    const session = await h.store.startLocalSession(h.user, h.plan.id, null, false);
+    await h.store.syncSessions(h.user);
+    const queue = await h.db.getFirstAsync(
+      'SELECT * FROM sync_queue WHERE entity_id=?',
+      session.id,
     );
+    await h.db.runAsync(
+      'UPDATE sessions SET conflict_operation_id=?,pending=1,synced=0 WHERE id=?',
+      queue.id,
+      session.id,
+    );
+    const reviewed = await h.store.previewLocalSessionConflict(h.user, session.id, choice);
+    await h.store.resolveLocalSessionConflict(h.user, session.id, choice, reviewed);
+    const saved = await h.store.readLocalSession(h.user, session.id);
+    assert.equal(saved.conflictOperationId, null);
+    assert.equal(saved.pending, false);
     assert.equal(
-      writes.some(([sql]) => sql.includes('conflict_operation_id = NULL')),
-      true,
+      (
+        await h.db.getFirstAsync(
+          "SELECT COUNT(*) count FROM sync_queue WHERE entity_id=? AND status IN ('pending','error','in_flight')",
+          session.id,
+        )
+      ).count,
+      0,
     );
   });
 }

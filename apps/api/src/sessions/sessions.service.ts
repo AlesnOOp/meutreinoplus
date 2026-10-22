@@ -3,11 +3,17 @@ import { HttpStatus } from '@nestjs/common';
 import {
   LoadValueError,
   hasUnfinishedPlannedSets,
-  mergePerformedSets,
+  effectiveSet,
   performedSetFingerprint,
   projectClock,
   projectRest,
   sessionPlanSnapshotSchema,
+  sessionConflictPreviewSchema,
+  sessionConflictResolveSchema,
+  sessionResolutionSchema,
+  sameSessionValue,
+  sessionDifferences,
+  sessionTimelineError,
   sessionSummary,
   sessionSyncPayloadSchema,
   toCanonicalKilograms,
@@ -18,6 +24,7 @@ import {
   type SyncOperationEnvelope,
 } from '@meutreino/shared';
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { Prisma } from '../generated/prisma/client';
 import { sha256 } from '../identity/crypto';
 import { fail } from '../identity/http';
@@ -499,22 +506,18 @@ export class SessionsService {
           'Informe um comentário ou uma avaliação.',
         );
       }
-      if (exercise.feedback) {
-        await tx.exerciseFeedback.update({
-          where: { id: exercise.feedback.id },
-          data: { perceivedLevel, comment, version: { increment: 1 } },
-        });
-      } else {
-        await tx.exerciseFeedback.create({
-          data: {
-            id: randomUUID(),
-            exerciseSessionId: exercise.id,
-            userId,
-            perceivedLevel,
-            comment,
-          },
-        });
-      }
+      await persistFeedback(
+        tx,
+        userId,
+        {
+          id: exercise.feedback?.id ?? randomUUID(),
+          exerciseSessionId: exercise.id,
+          perceivedLevel,
+          comment,
+          version: exercise.feedback?.version ?? 0,
+        },
+        false,
+      );
       await tx.workoutSession.update({
         where: { id: session.id },
         data: { version: { increment: 1 } },
@@ -609,39 +612,185 @@ export class SessionsService {
     }
   }
 
+  async previewConflict(
+    userId: string,
+    conflictId: string,
+    input: z.infer<typeof sessionConflictPreviewSchema>,
+  ) {
+    return this.prisma.$transaction(
+      async (tx) => {
+        const conflict = await tx.workoutSessionConflict.findFirst({
+          where: { id: conflictId, userId },
+        });
+        if (!conflict) throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Conflito não encontrado.');
+        if (conflict.status !== 'open')
+          throw fail(
+            HttpStatus.CONFLICT,
+            'conflict_already_resolved',
+            'Este conflito já foi resolvido em outro aparelho. Seus registros locais foram preservados.',
+          );
+        const session = await tx.workoutSession.findFirstOrThrow({
+          where: { id: conflict.workoutSessionId, userId },
+          include: sessionInclude,
+        });
+        await validateSessionReferences(tx, userId, input.payload, session);
+        return resolutionPreview(conflictId, session, input);
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+    );
+  }
+
+  async variants(userId: string, sessionId: string) {
+    await this.get(userId, sessionId);
+    const rows = await this.prisma.workoutSessionVariant.findMany({
+      where: { workoutSessionId: sessionId, resolution: { userId } },
+      include: { resolution: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    return rows.map((row) => ({
+      id: row.id,
+      resolutionId: row.resolutionId,
+      origin: row.origin,
+      choice: row.resolution.choice,
+      sourceRevision: row.sourceRevision,
+      createdAt: row.createdAt.toISOString(),
+      payload: row.payload,
+    }));
+  }
+
   async resolveConflict(
     userId: string,
     conflictId: string,
-    choice: 'keep_server' | 'keep_local' | 'keep_both',
+    input: z.infer<typeof sessionConflictResolveSchema>,
   ) {
-    const conflict = await this.prisma.workoutSessionConflict.findFirst({
-      where: { id: conflictId, userId },
-    });
-    if (!conflict) {
-      throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Conflito não encontrado.');
-    }
-    if (conflict.status !== 'open') {
-      return this.present(this.prisma, conflict.workoutSessionId, userId, false);
-    }
-    const payload = sessionSyncPayloadSchema.parse(conflict.payload);
-    if (choice === 'keep_local' || choice === 'keep_both') {
-      await this.mutate(userId, conflict.workoutSessionId, async (tx, session) => {
-        await validateSessionReferences(tx, userId, payload, session);
-        await this.applyClientCorrections(tx, userId, session, payload);
-        if (
-          !isTerminal(session) &&
-          (payload.status === 'completed' || payload.status === 'aborted')
-        ) {
-          await this.lock(tx, session, payload.status, payload.endedAt ?? undefined, payload.notes);
-        }
-        return null;
+    const requestHash = sha256(canonicalJsonString({ userId, conflictId, ...input }));
+    // Read committed + row locks: waiters see the winner's receipt after acquiring the lock.
+    return this.prisma
+      .$transaction(
+        async (tx) => {
+          const conflict = await tx.workoutSessionConflict.findFirst({
+            where: { id: conflictId, userId },
+          });
+          if (!conflict) throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Conflito não encontrado.');
+          await tx.$queryRaw`SELECT id FROM meutreino.workout_sessions WHERE id = ${conflict.workoutSessionId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM meutreino.workout_session_conflicts WHERE id = ${conflictId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
+          const session = await tx.workoutSession.findFirstOrThrow({
+            where: { id: conflict.workoutSessionId, userId },
+            include: sessionInclude,
+          });
+          await validateSessionReferences(tx, userId, input.payload, session);
+          const receipt = await tx.workoutSessionResolution.findUnique({
+            where: { id: input.idempotencyKey },
+          });
+          if (receipt) {
+            if (receipt.userId !== userId || receipt.requestHash !== requestHash)
+              throw fail(
+                HttpStatus.CONFLICT,
+                'idempotency_key_reused',
+                'Esta chave já foi utilizada para outra solicitação.',
+              );
+            return sessionResolutionSchema.parse(receipt.result);
+          }
+          const fresh = await tx.workoutSessionConflict.findUniqueOrThrow({
+            where: { id: conflictId },
+          });
+          if (fresh.status !== 'open')
+            throw fail(
+              HttpStatus.CONFLICT,
+              'conflict_already_resolved',
+              'Este conflito já foi resolvido em outro aparelho. Seus registros locais foram preservados.',
+            );
+          const preview = resolutionPreview(conflictId, session, input);
+          if (
+            input.expectedVersion !== session.version ||
+            input.previewHash !== preview.previewHash
+          )
+            throw fail(
+              HttpStatus.CONFLICT,
+              'resolution_stale',
+              'O treino mudou. Revise novamente as diferenças.',
+            );
+          if (preview.choice === 'keep_remote' && preview.changes.length && !input.confirmDiscard)
+            throw fail(
+              HttpStatus.CONFLICT,
+              'confirmation_required',
+              'Confirme as alterações listadas. Você também pode preservar ambas as versões.',
+            );
+          if (preview.choice === 'keep_local' && !preview.canApplyLocal)
+            throw fail(
+              HttpStatus.CONFLICT,
+              'incompatible_session',
+              preview.reason ?? 'Preserve ambas as versões.',
+            );
+          const remote = toPayload(session);
+          if (preview.choice === 'keep_local')
+            await this.reconcilePayload(tx, userId, session, input.payload, true);
+          else
+            await tx.workoutSession.update({
+              where: { id: session.id },
+              data: { version: { increment: 1 } },
+            });
+          const result = {
+            ...(await this.present(tx, session.id, userId, false)),
+            resolution: {
+              id: input.idempotencyKey,
+              choice: preview.choice,
+              localRevision: input.localRevision,
+            },
+          };
+          await tx.workoutSessionConflict.update({
+            where: { id: conflictId },
+            data: {
+              status: preview.choice === 'keep_remote' ? 'keep_server' : preview.choice,
+              resolvedAt: new Date(),
+            },
+          });
+          await tx.workoutSessionResolution.create({
+            data: {
+              id: input.idempotencyKey,
+              userId,
+              conflictId,
+              workoutSessionId: session.id,
+              choice: preview.choice,
+              localRevision: input.localRevision,
+              expectedVersion: input.expectedVersion,
+              requestHash,
+              result: jsonValue(result),
+            },
+          });
+          await tx.workoutSessionVariant.createMany({
+            data: [
+              {
+                id: randomUUID(),
+                resolutionId: input.idempotencyKey,
+                workoutSessionId: session.id,
+                origin: 'local',
+                sourceRevision: input.localRevision,
+                payload: jsonValue(input.payload),
+              },
+              {
+                id: randomUUID(),
+                resolutionId: input.idempotencyKey,
+                workoutSessionId: session.id,
+                origin: 'remote',
+                sourceRevision: session.version,
+                payload: jsonValue(remote),
+              },
+            ],
+          });
+          return result;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 15000 },
+      )
+      .catch((error: unknown) => {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')
+          throw fail(
+            HttpStatus.CONFLICT,
+            'idempotency_key_reused',
+            'Esta chave ou referência já foi utilizada. Revise o conflito.',
+          );
+        throw error;
       });
-    }
-    await this.prisma.workoutSessionConflict.update({
-      where: { id: conflict.id },
-      data: { status: choice, resolvedAt: new Date() },
-    });
-    return this.present(this.prisma, conflict.workoutSessionId, userId, false);
   }
 
   private async mergeSynced(
@@ -827,20 +976,7 @@ export class SessionsService {
     for (const correction of payload.corrections) {
       await insertCorrection(tx, userId, correction);
     }
-    for (const feedback of payload.feedback) {
-      if (feedback.perceivedLevel == null && !feedback.comment) {
-        continue;
-      }
-      await tx.exerciseFeedback.create({
-        data: {
-          id: feedback.id,
-          exerciseSessionId: feedback.exerciseSessionId,
-          userId,
-          perceivedLevel: feedback.perceivedLevel,
-          comment: feedback.comment,
-        },
-      });
-    }
+    for (const feedback of payload.feedback) await persistFeedback(tx, userId, feedback, false);
     for (const event of payload.timeEvents) {
       await tx.sessionTimeEvent.create({
         data: {
@@ -864,135 +1000,190 @@ export class SessionsService {
     baseVersion: number | null,
   ): Promise<{ status: 'applied' | 'conflict'; code?: string }> {
     const current = toPayload(session);
-    const merged = mergePerformedSets(
-      current.performedSets.map((set) => ({ ...set, fingerprint: performedSetFingerprint(set) })),
-      payload.performedSets.map((set) => ({ ...set, fingerprint: performedSetFingerprint(set) })),
-    );
-    const knownExercises = new Set(session.exercises.map((exercise) => exercise.id));
-    for (const set of merged.accepted) {
-      if (!knownExercises.has(set.exerciseSessionId)) {
-        continue;
-      }
-      await insertPerformedSet(tx, set);
+    const error = reconciliationError(current, payload);
+    if (error) return { status: 'conflict', code: 'incompatible_session' };
+    if (isTerminal(session) && !sameSessionValue(current, payload))
+      return { status: 'conflict', code: 'session_locked' };
+    if (baseVersion !== session.version) return { status: 'conflict', code: 'version_mismatch' };
+    if (
+      payload.performedSets.some((set) => {
+        const stored = current.performedSets.find((row) => row.id === set.id);
+        return stored && performedSetFingerprint(stored) !== performedSetFingerprint(set);
+      })
+    )
+      return { status: 'conflict', code: 'performed_set_diverged' };
+    if (
+      payload.feedback.some((item) => {
+        const stored = current.feedback.find(
+          (row) => row.exerciseSessionId === item.exerciseSessionId,
+        );
+        return (
+          stored &&
+          !feedbackEqual(stored, item) &&
+          (stored.id !== item.id || item.version !== stored.version)
+        );
+      })
+    )
+      return { status: 'conflict', code: 'feedback_diverged' };
+    if (
+      payload.performedSets.some(
+        (set) =>
+          !current.performedSets.some((row) => row.id === set.id) &&
+          current.performedSets.some(
+            (row) =>
+              row.exerciseSessionId === set.exerciseSessionId && row.setIndex === set.setIndex,
+          ),
+      )
+    )
+      return { status: 'conflict', code: 'set_index_taken' };
+    await this.reconcilePayload(tx, userId, session, payload, false);
+    return { status: 'applied' };
+  }
+
+  private async reconcilePayload(
+    tx: Tx,
+    userId: string,
+    session: LoadedSession,
+    payload: SessionSyncPayload,
+    resolving: boolean,
+  ) {
+    const current = toPayload(session);
+    if (isTerminal(session)) {
+      // No child mutations after finalization, even if values look mergeable.
+      if (!sameSessionValue(current, payload))
+        throw fail(
+          HttpStatus.CONFLICT,
+          'session_locked',
+          'Sessão encerrada: preserve ambas as versões.',
+        );
+      await tx.workoutSession.update({
+        where: { id: session.id },
+        data: { version: { increment: 1 } },
+      });
+      return;
     }
-    const knownCorrections = new Set(
-      session.exercises.flatMap((exercise) =>
-        exercise.sets.flatMap((set) => set.corrections.map((item) => item.id)),
-      ),
-    );
-    for (const correction of payload.corrections) {
-      if (!knownCorrections.has(correction.id)) {
-        const target = session.exercises
-          .flatMap((exercise) => exercise.sets)
-          .some((set) => set.id === correction.performedSetId);
-        const accepted = merged.accepted.some((set) => set.id === correction.performedSetId);
-        if (target || accepted) {
-          await insertCorrection(tx, userId, correction);
-        }
+    const used = [...current.performedSets];
+    const divergent: PerformedCorrectionSync[] = [];
+    const correctionTime = new Date(
+      Math.max(
+        Date.now(),
+        ...current.corrections.map((row) => Date.parse(row.createdAt)),
+        ...payload.corrections.map((row) => Date.parse(row.createdAt)),
+      ) + 1,
+    ).toISOString();
+    for (const set of payload.performedSets) {
+      const stored = current.performedSets.find((row) => row.id === set.id);
+      if (stored) {
+        const desired = effectiveSet(set, payload.corrections);
+        const actual = effectiveSet(stored, [
+          ...current.corrections,
+          ...payload.corrections.filter(
+            (row) => !current.corrections.some((existing) => existing.id === row.id),
+          ),
+        ]);
+        if (
+          resolving &&
+          (desired.repetitions !== actual.repetitions ||
+            desired.load !== actual.load ||
+            desired.loadUnit !== actual.loadUnit ||
+            desired.voided !== actual.voided)
+        )
+          divergent.push({
+            id: randomUUID(),
+            performedSetId: stored.id,
+            repetitions: desired.repetitions,
+            load: desired.load,
+            loadUnit: desired.loadUnit,
+            voided: desired.voided,
+            reason: 'Valor preservado na reconciliação.',
+            createdAt: correctionTime,
+          });
+      } else {
+        let setIndex = set.setIndex;
+        while (
+          used.some(
+            (row) => row.exerciseSessionId === set.exerciseSessionId && row.setIndex === setIndex,
+          )
+        )
+          setIndex++;
+        if (setIndex > 40)
+          throw fail(
+            HttpStatus.CONFLICT,
+            'set_limit',
+            'Limite de séries: preserve ambas as versões.',
+          );
+        const inserted = { ...set, setIndex };
+        await insertPerformedSet(tx, inserted);
+        used.push(inserted);
       }
     }
-    const knownEvents = new Set(session.timeEvents.map((event) => event.id));
-    for (const event of payload.timeEvents) {
-      if (!knownEvents.has(event.id)) {
+    for (const correction of payload.corrections)
+      if (!current.corrections.some((row) => row.id === correction.id))
+        await insertCorrection(tx, userId, correction);
+    // Explicit choice wins via a NEW correction after all supplied historical corrections.
+    for (const correction of divergent) await insertCorrection(tx, userId, correction);
+    for (const feedback of payload.feedback) {
+      const stored = current.feedback.find(
+        (row) => row.exerciseSessionId === feedback.exerciseSessionId,
+      );
+      if (!stored || !feedbackEqual(stored, feedback))
+        await persistFeedback(
+          tx,
+          userId,
+          { ...feedback, id: stored?.id ?? feedback.id },
+          resolving,
+        );
+    }
+    for (const event of payload.timeEvents)
+      if (!current.timeEvents.some((row) => row.id === event.id))
         await tx.sessionTimeEvent.create({
           data: {
             id: event.id,
             workoutSessionId: session.id,
-            exerciseSessionId: knownExercises.has(event.exerciseSessionId ?? '')
-              ? event.exerciseSessionId
-              : null,
+            exerciseSessionId: event.exerciseSessionId,
             kind: event.kind,
             occurredAt: new Date(event.occurredAt),
             restDurationSeconds: event.restDurationSeconds,
           },
         });
-      }
-    }
-    const versionsMatch = baseVersion != null && baseVersion === session.version;
-    if (!isTerminal(session) && versionsMatch) {
-      for (const exercise of payload.exerciseSessions) {
-        const currentExercise = session.exercises.find((item) => item.id === exercise.id);
-        if (!currentExercise || currentExercise.status === exercise.status) {
-          continue;
-        }
-        await tx.exerciseSession.update({
-          where: { id: currentExercise.id },
-          data: {
-            status: exercise.status,
-            skipReason: exercise.status === 'skipped' ? exercise.skipReason || 'Pulado' : null,
-            endedAt:
-              exercise.status === 'completed' || exercise.status === 'skipped' ? new Date() : null,
-          },
-        });
-      }
-      if (payload.notes !== session.notes) {
-        await tx.workoutSession.update({
-          where: { id: session.id },
-          data: { notes: payload.notes },
-        });
-      }
-      if (payload.status === 'paused' && session.status === 'in_progress') {
-        await tx.workoutSession.update({
-          where: { id: session.id },
-          data: { status: 'paused', pausedAt: pausedInstant(payload) },
-        });
-      }
-      if (payload.status === 'in_progress' && session.status === 'paused') {
-        await tx.workoutSession.update({
-          where: { id: session.id },
-          data: { status: 'in_progress', pausedAt: null },
-        });
-      }
+    for (const exercise of payload.exerciseSessions) {
+      const stored = current.exerciseSessions.find((row) => row.id === exercise.id);
       if (
-        (payload.status === 'completed' || payload.status === 'aborted') &&
-        !isTerminal(session)
-      ) {
-        await this.lock(tx, session, payload.status, payload.endedAt ?? undefined, payload.notes);
-      }
-    }
-    await tx.workoutSession.update({
-      where: { id: session.id },
-      data: { version: { increment: 1 } },
-    });
-    if (merged.divergent.length > 0) {
-      return { status: 'conflict', code: 'performed_set_diverged' };
-    }
-    if (isTerminal(session) && merged.accepted.length > 0) {
-      return { status: 'conflict', code: 'session_locked' };
-    }
-    if (!versionsMatch && session.version !== 1) {
-      return { status: 'conflict', code: 'version_mismatch' };
-    }
-    return { status: 'applied' };
-  }
-
-  private async applyClientCorrections(
-    tx: Tx,
-    userId: string,
-    session: LoadedSession,
-    payload: SessionSyncPayload,
-  ) {
-    const current = toPayload(session);
-    const merged = mergePerformedSets(
-      current.performedSets.map((set) => ({ ...set, fingerprint: performedSetFingerprint(set) })),
-      payload.performedSets.map((set) => ({ ...set, fingerprint: performedSetFingerprint(set) })),
-    );
-    for (const item of merged.divergent) {
-      const stored = encodeLoad(item.client.load, item.client.loadUnit ?? undefined);
-      await tx.performedSetCorrection.create({
+        !stored ||
+        (stored.status === exercise.status && stored.skipReason === exercise.skipReason)
+      )
+        continue;
+      await tx.exerciseSession.update({
+        where: { id: exercise.id },
         data: {
-          id: randomUUID(),
-          performedSetId: item.server.id,
-          correctedByUserId: userId,
-          performedRepetitions: item.client.repetitions,
-          performedLoad: stored.entered,
-          performedLoadUnit: stored.unit,
-          performedLoadKg: stored.kg,
-          voided: false,
-          reason: 'Valor preservado na reconciliação.',
+          status: exercise.status,
+          skipReason: exercise.status === 'skipped' ? exercise.skipReason || 'Pulado' : null,
+          endedAt: ['completed', 'skipped'].includes(exercise.status)
+            ? new Date(payload.endedAt ?? new Date().toISOString())
+            : null,
         },
       });
     }
+    const merged = mergeTimeline(current, payload);
+    const terminal = payload.status === 'completed' || payload.status === 'aborted';
+    const clock = terminal ? projectClock(merged, payload.endedAt!) : null;
+    await tx.workoutSession.update({
+      where: { id: session.id },
+      data: {
+        status: payload.status,
+        notes: payload.notes,
+        pausedAt: payload.status === 'paused' ? pausedInstant(merged) : null,
+        ...(terminal
+          ? {
+              endedAt: new Date(payload.endedAt!),
+              lockedAt: new Date(payload.endedAt!),
+              durationSeconds: clock!.activeSeconds,
+              elapsedSeconds: clock!.elapsedSeconds,
+            }
+          : {}),
+        version: { increment: 1 },
+      },
+    });
   }
 
   private async transition(
@@ -1164,7 +1355,7 @@ export class SessionsService {
       pausedAt: session.pausedAt?.toISOString() ?? null,
       lockedAt: session.lockedAt?.toISOString() ?? null,
       clockAdjusted,
-      rest: projectRest(payload.timeEvents, now),
+      rest: isTerminal(session) ? null : projectRest(payload.timeEvents, now),
       unfinished: hasUnfinishedPlannedSets(payload),
     };
   }
@@ -1236,6 +1427,7 @@ function toPayload(
         ? [
             {
               id: exercise.feedback.id,
+              version: exercise.feedback.version,
               exerciseSessionId: exercise.id,
               perceivedLevel: exercise.feedback.perceivedLevel,
               comment: exercise.feedback.comment,
@@ -1337,7 +1529,9 @@ function resolveInstant(value: string | undefined, startedAt: Date, now = new Da
 }
 
 function pausedInstant(payload: SessionSyncPayload): Date {
-  const pause = [...payload.timeEvents].reverse().find((event) => event.kind === 'pause');
+  const pause = [...payload.timeEvents]
+    .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
+    .find((event) => event.kind === 'pause');
   return new Date(pause?.occurredAt ?? payload.startedAt);
 }
 
@@ -1360,4 +1554,146 @@ function isOpenSessionConstraint(error: unknown): boolean {
 
 function jsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function feedbackEqual(
+  a: SessionSyncPayload['feedback'][number],
+  b: SessionSyncPayload['feedback'][number],
+) {
+  return a.perceivedLevel === b.perceivedLevel && a.comment === b.comment;
+}
+async function persistFeedback(
+  tx: Tx,
+  userId: string,
+  input: SessionSyncPayload['feedback'][number],
+  resolving: boolean,
+) {
+  const previous = await tx.exerciseFeedback.findUnique({
+    where: { exerciseSessionId: input.exerciseSessionId },
+  });
+  if (
+    previous &&
+    feedbackEqual(
+      { ...input, perceivedLevel: previous.perceivedLevel, comment: previous.comment },
+      input,
+    )
+  )
+    return;
+  if (previous && !resolving && (previous.id !== input.id || previous.version !== input.version))
+    throw fail(
+      HttpStatus.CONFLICT,
+      'feedback_diverged',
+      'Há outra avaliação. Revise o conflito antes de substituir.',
+    );
+  if (previous)
+    await tx.exerciseFeedbackRevision.upsert({
+      where: { feedbackId_version: { feedbackId: previous.id, version: previous.version } },
+      create: { feedbackId: previous.id, version: previous.version, payload: jsonValue(previous) },
+      update: {},
+    });
+  const data = { perceivedLevel: input.perceivedLevel, comment: input.comment };
+  const saved = previous
+    ? await tx.exerciseFeedback.update({
+        where: { id: previous.id },
+        data: { ...data, version: { increment: 1 } },
+      })
+    : await tx.exerciseFeedback.create({
+        data: { id: input.id, exerciseSessionId: input.exerciseSessionId, userId, ...data },
+      });
+  await tx.exerciseFeedbackRevision.create({
+    data: { feedbackId: saved.id, version: saved.version, payload: jsonValue(saved) },
+  });
+}
+function mergeTimeline(remote: SessionSyncPayload, local: SessionSyncPayload): SessionSyncPayload {
+  const ids = new Set(remote.timeEvents.map((row) => row.id));
+  const sets = new Map(remote.performedSets.map((set) => [set.id, set]));
+  for (const set of local.performedSets) sets.set(set.id, set);
+  return {
+    ...local,
+    performedSets: [...sets.values()],
+    timeEvents: [...remote.timeEvents, ...local.timeEvents.filter((row) => !ids.has(row.id))],
+  };
+}
+function reconciliationError(remote: SessionSyncPayload, local: SessionSyncPayload): string | null {
+  for (const key of [
+    'planSnapshot',
+    'planVersion',
+    'planName',
+    'gymId',
+    'gymName',
+    'startedAt',
+  ] as const)
+    if (!sameSessionValue(remote[key], local[key]))
+      return 'A fotografia histórica é imutável. Preserve ambas as versões.';
+  if (remote.exerciseSessions.length !== local.exerciseSessions.length)
+    return 'A lista de exercícios da execução é imutável.';
+  for (const exercise of local.exerciseSessions) {
+    const stored = remote.exerciseSessions.find((row) => row.id === exercise.id);
+    if (
+      !stored ||
+      !sameSessionValue(
+        { ...stored, status: exercise.status, skipReason: exercise.skipReason },
+        exercise,
+      )
+    )
+      return 'Os dados congelados do exercício são imutáveis.';
+  }
+  for (const key of ['corrections', 'timeEvents'] as const)
+    for (const item of local[key]) {
+      const stored = remote[key].find((row) => row.id === item.id);
+      if (stored && !sameSessionValue(stored, item))
+        return 'Um evento confirmado não pode ser reescrito. Preserve ambas as versões.';
+    }
+  for (const set of local.performedSets) {
+    const stored = remote.performedSets.find((row) => row.id === set.id);
+    if (
+      stored &&
+      !sameSessionValue(
+        { ...stored, repetitions: set.repetitions, load: set.load, loadUnit: set.loadUnit },
+        set,
+      )
+    )
+      return 'A série exige uma nova correção; dados originais não podem ser reescritos.';
+  }
+  if (
+    (remote.status === 'completed' || remote.status === 'aborted') &&
+    !sameSessionValue(remote, local)
+  )
+    return 'Sessão encerrada: preserve ambas as versões, sem reabrir o treino.';
+  return sessionTimelineError(mergeTimeline(remote, local));
+}
+function resolutionPreview(
+  conflictId: string,
+  session: LoadedSession,
+  input: z.infer<typeof sessionConflictPreviewSchema>,
+) {
+  const remote = toPayload(session);
+  const choice = input.choice === 'keep_server' ? 'keep_remote' : input.choice;
+  const changes = sessionDifferences(remote, input.payload);
+  const reason = reconciliationError(remote, input.payload);
+  return {
+    choice,
+    remoteVersion: session.version,
+    localRevision: input.localRevision,
+    previewHash: sha256(
+      canonicalJsonString({
+        conflictId,
+        remote,
+        remoteVersion: session.version,
+        payload: input.payload,
+        localRevision: input.localRevision,
+        choice,
+      }),
+    ),
+    changes,
+    containsExecution:
+      input.payload.performedSets.some(
+        (set) => !remote.performedSets.some((stored) => sameSessionValue(stored, set)),
+      ) ||
+      input.payload.corrections.some(
+        (correction) => !remote.corrections.some((stored) => sameSessionValue(stored, correction)),
+      ),
+    canApplyLocal: !reason,
+    reason,
+  };
 }

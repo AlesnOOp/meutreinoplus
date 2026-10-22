@@ -20,7 +20,13 @@ export type SyncOperationType = (typeof SYNC_OPERATION_TYPES)[number];
 export const SERVER_SYNC_STATUSES = ['pending', 'applied', 'rejected', 'conflict'] as const;
 export type ServerSyncStatus = (typeof SERVER_SYNC_STATUSES)[number];
 
-export const DEVICE_QUEUE_STATUSES = ['pending', 'in_flight', 'error', 'done'] as const;
+export const DEVICE_QUEUE_STATUSES = [
+  'pending',
+  'in_flight',
+  'error',
+  'done',
+  'superseded',
+] as const;
 export type DeviceQueueStatus = (typeof DEVICE_QUEUE_STATUSES)[number];
 
 export type SyncDomain =

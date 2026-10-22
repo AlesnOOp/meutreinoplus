@@ -1,21 +1,21 @@
 # Sincronização da sessão
 
-O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 4, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
+O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 6, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
 
 ## Envio
 
 `syncSessions` sincroniza as fichas e depois envia só `workout_session`. A operação `correct` global continua recusada para academia, equipamento, exercício e ficha. A correção de série viaja dentro do upsert da sessão.
 
-O servidor aplica o agregado numa transação com `SELECT … FOR UPDATE` e o recibo em `sync_operations`.
+O servidor aplica o agregado em transação serializável, com recibo em `sync_operations`. A resolução usa bloqueios explícitos de sessão/conflito e recibo próprio em `workout_session_resolutions`.
 
 - A fotografia, a versão da ficha, a academia e o início não são atualizados depois da inserção.
-- Série nova é inserida, mesmo que a sessão já esteja travada. Nesse caso o recibo fica em conflito `session_locked`. A série não é apagada.
+- Alterações em sessão travada e agregados divergentes ficam em conflito antes de qualquer gravação parcial. O payload local permanece recuperável.
 - O mesmo identificador de série com outro conteúdo não altera a linha. O recibo fica em conflito `performed_set_diverged` e o payload do cliente fica em `workout_session_conflicts`.
 - Correção e evento de tempo novos entram pelo identificador. Repetir o mesmo identificador não duplica.
 - Notas, status e status dos exercícios só mudam quando `baseVersion` é a versão do servidor e a sessão ainda está aberta.
 - A mesma chave de idempotência com o mesmo hash reconhece a operação. A mesma chave com outro hash responde `idempotency_key_reused`.
 
-`keep_local` e `keep_both` inserem uma correção “Valor preservado na reconciliação.” A linha original permanece. `keep_server` adota a leitura do servidor no aparelho. Essa escolha é explícita.
+A resolução exige prévia, revisão local, versão remota esperada, chave idempotente e confirmação de descarte. `keep_local` reconcilia o agregado; `keep_remote` (`keep_server`) escolhe o remoto; `keep_both` preserva duas variantes imutáveis da mesma execução, mantendo o remoto como principal. Veja o contrato completo em [RECOVERY_03_CONFLICT_POLICY.md](RECOVERY_03_CONFLICT_POLICY.md).
 
 ## Sessão nascida offline
 

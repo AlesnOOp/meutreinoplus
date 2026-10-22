@@ -97,6 +97,7 @@ export const performedCorrectionSyncSchema = performedLoadSchema.extend({
 });
 
 export const sessionFeedbackSyncSchema = z.object({
+  version: z.number().int().nonnegative().default(0),
   id: z.uuid(),
   exerciseSessionId: z.uuid(),
   perceivedLevel: z.number().int().min(1).max(5).nullable(),
@@ -196,8 +197,16 @@ export const restActionSchema = z.object({
   exerciseSessionId: z.uuid().nullable().optional(),
 });
 
-export const sessionConflictResolveSchema = z.object({
-  choice: z.enum(['keep_server', 'keep_local', 'keep_both']),
+export const sessionConflictPreviewSchema = z.object({
+  choice: z.enum(['keep_remote', 'keep_server', 'keep_local', 'keep_both']),
+  localRevision: z.number().int().nonnegative(),
+  payload: sessionSyncPayloadSchema,
+});
+export const sessionConflictResolveSchema = sessionConflictPreviewSchema.extend({
+  idempotencyKey: z.uuid(),
+  expectedVersion: z.number().int().positive(),
+  previewHash: z.string().regex(/^[a-f0-9]{64}$/),
+  confirmDiscard: z.boolean().default(false),
 });
 
 export const restViewSchema = z.object({

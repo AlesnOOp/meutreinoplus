@@ -344,10 +344,24 @@ describe('Workout sessions API', () => {
     expect(conflict.body.results[0].code).toBe('performed_set_diverged');
     const kept = await prisma.performedSet.findUniqueOrThrow({ where: { id: setId } });
     expect(kept.performedRepetitions).toBe(10);
+    const local = sessionSyncPayloadSchema.parse(divergent.payload);
+    const reviewed = await request(server())
+      .post(`/api/v1/workout-session-conflicts/${divergent.id}/preview`)
+      .set(bearer(owner.token))
+      .send({ choice: 'keep_local', localRevision: 1, payload: local })
+      .expect(200);
     await request(server())
       .post(`/api/v1/workout-session-conflicts/${divergent.id}/resolve`)
       .set(bearer(owner.token))
-      .send({ choice: 'keep_local' })
+      .send({
+        choice: 'keep_local',
+        payload: local,
+        localRevision: 1,
+        expectedVersion: reviewed.body.remoteVersion as number,
+        previewHash: reviewed.body.previewHash as string,
+        idempotencyKey: randomUUID(),
+        confirmDiscard: false,
+      })
       .expect(200);
     const after = await prisma.performedSet.findUniqueOrThrow({ where: { id: setId } });
     expect(after.performedRepetitions).toBe(10);

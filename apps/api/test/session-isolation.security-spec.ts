@@ -266,6 +266,7 @@ describe('Recovery 01: real PostgreSQL session reference isolation', () => {
       {
         id: randomUUID(),
         exerciseSessionId: b.payload.exerciseSessions[0]!.id,
+        version: 0,
         perceivedLevel: 3,
         comment: null,
       },
@@ -299,6 +300,7 @@ describe('Recovery 01: real PostgreSQL session reference isolation', () => {
       {
         id: randomUUID(),
         exerciseSessionId: p.exerciseSessions[0]!.id,
+        version: 0,
         perceivedLevel: 4,
         comment: 'legítimo',
       },
@@ -323,6 +325,7 @@ describe('Recovery 01: real PostgreSQL session reference isolation', () => {
           {
             id: randomUUID(),
             exerciseSessionId: b.payload.exerciseSessions[0]!.id,
+            version: 0,
             perceivedLevel: 3,
             comment: null,
           },
@@ -408,7 +411,13 @@ describe('Recovery 01: real PostgreSQL session reference isolation', () => {
       if (kind === 'set') p.performedSets[0]!.exerciseSessionId = other;
       if (kind === 'feedback')
         p.feedback = [
-          { id: randomUUID(), exerciseSessionId: other, perceivedLevel: 3, comment: null },
+          {
+            id: randomUUID(),
+            exerciseSessionId: other,
+            version: 0,
+            perceivedLevel: 3,
+            comment: null,
+          },
         ];
       if (kind === 'event') p.timeEvents = [event(other)];
       await rejected(p);
@@ -533,6 +542,7 @@ describe('Recovery 01: real PostgreSQL session reference isolation', () => {
       {
         id: randomUUID(),
         exerciseSessionId: p.exerciseSessions[0]!.id,
+        version: 0,
         perceivedLevel: 3,
         comment: 'Seguro',
       },

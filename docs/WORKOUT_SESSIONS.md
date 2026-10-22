@@ -6,13 +6,13 @@ Uma sessão registra o que foi feito a partir de uma ficha. Ela não é a ficha.
 
 O status persistido é `in_progress`, `paused`, `completed` ou `aborted`. Na interface, `aborted` aparece como Cancelado. Não existe um segundo valor `cancelled`.
 
-| De            | Para          | Condição                                                                 |
-| ------------- | ------------- | ------------------------------------------------------------------------ |
+| De            | Para          | Condição                                                                    |
+| ------------- | ------------- | --------------------------------------------------------------------------- |
 | —             | `in_progress` | A ficha é do usuário, está ativa e tem revisão. Não há outra sessão aberta. |
-| `in_progress` | `paused`      | Grava `paused_at` e um evento `pause`.                                   |
-| `paused`      | `in_progress` | Limpa `paused_at` e grava um evento `resume`.                            |
-| aberta        | `completed`   | Confirma se ainda houver série planejada sem resultado. Trava a sessão.  |
-| aberta        | `aborted`     | Exige `confirm: true`. Trava a sessão.                                   |
+| `in_progress` | `paused`      | Grava `paused_at` e um evento `pause`.                                      |
+| `paused`      | `in_progress` | Limpa `paused_at` e grava um evento `resume`.                               |
+| aberta        | `completed`   | Confirma se ainda houver série planejada sem resultado. Trava a sessão.     |
+| aberta        | `aborted`     | Exige `confirm: true`. Trava a sessão.                                      |
 
 Uma sessão travada não volta a aberta. Finalizar de novo responde `409 session_locked`. O mesmo identificador de sessão, reenviado no início, devolve a sessão existente. Um segundo início, com outro identificador e com uma sessão ainda aberta, responde `409 session_open`.
 
@@ -47,7 +47,7 @@ Tudo em `/api/v1`, com o mesmo acesso das etapas anteriores, tag Treinos no Swag
 - `POST /workout-sessions/:id/sets`, `/sets/:setId/correct`, `/sets/:setId/undo`.
 - `POST /workout-sessions/:id/exercises/:exerciseSessionId/complete`, `/skip`, `/feedback`.
 - `POST /workout-sessions/:id/rest`.
-- `POST /workout-session-conflicts/:id/resolve` com `keep_server`, `keep_local` ou `keep_both`.
+- `POST /workout-session-conflicts/:id/preview` e `/resolve` com revisão, prévia e chave idempotente; `GET /workout-sessions/:id/variants`. Semântica de `keep_remote`, `keep_local`, `keep_both` e alias `keep_server` em [RECOVERY_03_CONFLICT_POLICY.md](RECOVERY_03_CONFLICT_POLICY.md).
 
 Finalizar com série planejada ainda em aberto e sem `confirmIncomplete` responde `409 incomplete_session`. Cancelar sem `confirm` responde `400 confirmation_required`.
 

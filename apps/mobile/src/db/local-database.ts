@@ -5,7 +5,7 @@ import {
 } from '@meutreino/shared';
 import * as SQLite from 'expo-sqlite';
 
-const SCHEMA_VERSION = '5';
+const SCHEMA_VERSION = '6';
 
 export type LocalDatabaseStatus = {
   ready: true;
@@ -36,6 +36,22 @@ async function initialize(userId: string): Promise<SQLite.SQLiteDatabase> {
   await database.execAsync('PRAGMA journal_mode = WAL;');
   await database.execAsync('PRAGMA foreign_keys = ON;');
   await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS session_resolution_intents (
+      id TEXT PRIMARY KEY NOT NULL,
+      session_id TEXT NOT NULL,
+      conflict_id TEXT NOT NULL,
+      local_revision INTEGER NOT NULL,
+      request TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      result TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS session_resolution_pending ON session_resolution_intents(session_id) WHERE status = 'pending';
+    CREATE TABLE IF NOT EXISTS session_variants (
+      id TEXT PRIMARY KEY NOT NULL,
+      session_id TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS local_meta (
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT NOT NULL
@@ -195,7 +211,7 @@ async function migrateSchemaInTransaction(database: SQLite.SQLiteDatabase): Prom
       'stale_remote_version',
       `ALTER TABLE ${table} ADD COLUMN stale_remote_version INTEGER`,
     );
-    if (version?.value !== SCHEMA_VERSION) {
+    if (Number(version?.value ?? '0') < 5) {
       // Legacy queue entries remain revision 0. Dirty local rows get a newer revision;
       // the sync pass durably enqueues their latest payload before sending old entries.
       await database.runAsync(

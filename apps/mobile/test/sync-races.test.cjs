@@ -520,7 +520,7 @@ test('SQLite v4 migration keeps legacy queue and dirty newer row, then converges
   assert.equal(row.synced, 0);
   assert.equal(
     (await h.db.getFirstAsync("SELECT value FROM local_meta WHERE key='schema_version'")).value,
-    '5',
+    '6',
   );
   const queued = await h.db.getAllAsync(
     "SELECT * FROM sync_queue WHERE entity_type='gym' ORDER BY rowid",
@@ -747,10 +747,19 @@ test('session: edits during conflict resolution remain explicitly pending (Achad
   assert.equal(after.payload, before.payload);
   assert.equal(after.pending, 1);
   assert.equal(after.synced, 0);
-  assert.equal(after.conflict_operation_id, queue.id);
+  assert.equal(after.conflict_operation_id, null);
+  assert.equal(
+    (
+      await h.db.getFirstAsync(
+        "SELECT COUNT(*) count FROM sync_queue WHERE entity_id=? AND status='pending'",
+        session.id,
+      )
+    ).count,
+    1,
+  );
   assert.equal(
     (await h.db.getFirstAsync('SELECT status FROM sync_queue WHERE id=?', queue.id)).status,
-    'error',
+    'superseded',
   );
 });
 

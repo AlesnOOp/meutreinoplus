@@ -98,6 +98,10 @@ export async function validateSessionReferences(
     uniqueIds(rows);
   }
 
+  if (
+    new Set(payload.feedback.map((item) => item.exerciseSessionId)).size !== payload.feedback.length
+  )
+    invalidSessionReferences();
   const exercises = new Map(existing?.exercises.map((exercise) => [exercise.id, exercise]) ?? []);
   const storedExercises = await tx.exerciseSession.findMany({
     where: { id: { in: payload.exerciseSessions.map((exercise) => exercise.id) } },
