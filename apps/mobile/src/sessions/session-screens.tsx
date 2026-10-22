@@ -256,6 +256,7 @@ export function SessionScreen() {
     >
       {error ? <Notice tone="error" message={error} /> : null}
       {!online ? <Notice message="Sem conexão. As séries ficam salvas neste aparelho." /> : null}
+      {session.dependencyError ? <Notice tone="error" message={session.dependencyError} /> : null}
       {session.pending ? (
         <Notice message="Há registros deste treino ainda não sincronizados." />
       ) : null}

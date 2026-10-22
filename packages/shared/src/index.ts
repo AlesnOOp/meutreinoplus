@@ -248,3 +248,6 @@ export type { SyncOperationEnvelope } from './sync/operation';
 
 export { sessionConflictPreviewSchema } from './sessions/contracts';
 export * from './sessions/resolution';
+
+export { planSyncMutationSchema } from './plans/contracts';
+export { canonicalPlanContent } from './plans/canonical';

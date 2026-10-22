@@ -1,5 +1,6 @@
 import {
   canonicalJsonString,
+  canonicalPlanContent,
   rebaseSessionEdits,
   sessionResolutionSchema,
   sessionConflictResolveSchema,
@@ -33,6 +34,7 @@ import {
   revision,
   singleSync,
 } from '@/db/sync-state';
+import { getPlanRevisionRequest } from '@/api/plans';
 import { readLocalPlan, syncPlans } from '@/plans/plan-store';
 
 type Database = Awaited<ReturnType<typeof openLocalDatabase>>;
@@ -50,10 +52,12 @@ type SessionRow = {
   conflict_operation_id: string | null;
   local_revision: number;
   acknowledged_revision: number;
+  dependency_error: string | null;
 };
 
 export type LocalSession = SessionSyncPayload & {
   serverVersion: number;
+  dependencyError: string | null;
   pending: boolean;
   synced: boolean;
   conflictOperationId: string | null;
@@ -105,19 +109,21 @@ export async function startLocalSession(
     throw new Error('Ficha não encontrada.');
   }
   const now = new Date().toISOString();
-  const snapshot = sessionPlanSnapshotSchema.parse({
-    id: plan.id,
-    name: plan.name,
-    description: plan.description,
-    accent: plan.accent,
-    status: plan.status,
-    version: plan.version,
-    duplicatedFromId: null,
-    createdAt: plan.updatedAt,
-    updatedAt: plan.updatedAt,
-    archivedAt: null,
-    exercises: plan.exercises,
-  });
+  const snapshot = sessionPlanSnapshotSchema.parse(
+    (!plan.pending ? plan.officialSnapshot : undefined) ?? {
+      id: plan.id,
+      name: plan.name,
+      description: plan.description,
+      accent: plan.accent,
+      status: plan.status,
+      version: plan.pending ? 0 : plan.version,
+      duplicatedFromId: null,
+      createdAt: plan.updatedAt,
+      updatedAt: plan.updatedAt,
+      archivedAt: null,
+      exercises: plan.exercises,
+    },
+  );
   const sessionId = Crypto.randomUUID();
   const exerciseSessions = snapshot.exercises.map((exercise) => {
     const equipment = gym ? exercise.equipment.find((item) => item.gymId === gym.id) : undefined;
@@ -138,7 +144,7 @@ export async function startLocalSession(
   const local = sessionSyncPayloadSchema.parse({
     id: sessionId,
     planId: plan.id,
-    planVersion: Math.max(plan.version, 0),
+    planVersion: plan.pending ? 0 : Math.max(plan.version, 0),
     planName: snapshot.name,
     gymId: gym?.id ?? null,
     gymName: gym?.name ?? null,
@@ -153,7 +159,7 @@ export async function startLocalSession(
     feedback: [],
     timeEvents: [],
   });
-  await persist(userId, local, 0, true);
+  await persist(userId, local, 0, true, plan.originRevisionId ?? null);
   if (!online || !synced.synced || synced.conflicts > 0) {
     return (await readLocalSession(userId, sessionId))!;
   }
@@ -393,6 +399,7 @@ async function runSessionSync(userId: string): Promise<{ synced: boolean; confli
     if (isNetworkError(error)) return { synced: false, conflicts: plans.conflicts };
     throw error;
   }
+  await repairLegacyBindings(database);
   await adoptSyncedPlans(userId, database);
   const queued = await claimOperations(database, ['workout_session']);
   let conflicts = plans.conflicts;
@@ -788,9 +795,12 @@ async function persist(
   payload: SessionSyncPayload,
   serverVersion: number,
   _queue: boolean,
+  sourceRevisionId: string | null = null,
 ): Promise<void> {
   const database = await openLocalDatabase(userId);
-  await localTransaction(database, (tx) => persistLocal(tx, userId, payload, serverVersion));
+  await localTransaction(database, (tx) =>
+    persistLocal(tx, userId, payload, serverVersion, sourceRevisionId),
+  );
 }
 
 async function writeSession(
@@ -828,6 +838,7 @@ async function persistLocal(
   userId: string,
   payload: SessionSyncPayload,
   serverVersion: number,
+  sourceRevisionId: string | null = null,
 ): Promise<void> {
   const existing = await database.getFirstAsync<SessionRow>(
     `SELECT * FROM sessions WHERE id = ?`,
@@ -842,8 +853,14 @@ async function persistLocal(
     next,
     existing?.conflict_operation_id ?? null,
   );
+  if (sourceRevisionId)
+    await database.runAsync(
+      'UPDATE sessions SET source_plan_revision_id = ? WHERE id = ?',
+      sourceRevisionId,
+      payload.id,
+    );
   if (!existing?.conflict_operation_id) {
-    const ready = await readyPayload(userId, payload);
+    const ready = await readyPayload(userId, payload, database);
     if (ready)
       await enqueueSession(database, ready, existing?.server_version ?? serverVersion, next);
   }
@@ -935,30 +952,88 @@ async function reconcileFeedbackVersions(database: Database, remote: SessionSync
 async function readyPayload(
   userId: string,
   payload: SessionSyncPayload,
+  connection?: Database,
 ): Promise<SessionSyncPayload | null> {
-  if (payload.planVersion >= 1) {
+  if (payload.planVersion >= 1 && payload.planSnapshot.version === payload.planVersion)
     return payload;
-  }
-  const plan = await readLocalPlan(userId, payload.planId);
-  if (!plan || plan.version < 1 || !plan.synced) {
-    return null;
-  }
-  const same = payload.planSnapshot.exercises.every((exercise) => {
-    const current = plan.exercises.find((item) => item.id === exercise.id);
-    if (!current) {
-      return false;
-    }
-    return exercise.sets.every((set) =>
-      current.sets.some(
-        (item) =>
-          item.id === set.id && item.load === set.load && item.repetitions === set.repetitions,
-      ),
+  const database = connection ?? (await openLocalDatabase(userId));
+  const origin = await database.getFirstAsync<{
+    server_version: number | null;
+    official_snapshot: string | null;
+  }>(
+    `SELECT r.server_version,r.official_snapshot FROM sessions s JOIN local_plan_revisions r ON r.id=s.source_plan_revision_id WHERE s.id=?`,
+    payload.id,
+  );
+  let official: SessionSyncPayload['planSnapshot'] | null = null;
+  if (origin?.server_version && origin.official_snapshot)
+    official = sessionPlanSnapshotSchema.parse(JSON.parse(origin.official_snapshot));
+  if (!origin) {
+    const row = await database.getFirstAsync<{ payload: string; version: number; pending: number }>(
+      'SELECT payload,version,pending FROM plans WHERE id=?',
+      payload.planId,
     );
-  });
-  if (!same || payload.planSnapshot.exercises.length !== plan.exercises.length) {
-    return null;
+    if (row && row.version > 0 && !row.pending) {
+      const parsed = sessionPlanSnapshotSchema.safeParse(JSON.parse(row.payload));
+      if (parsed.success) official = parsed.data;
+    }
   }
-  return sessionSyncPayloadSchema.parse({ ...payload, planVersion: plan.version });
+  if (!official || canonicalPlanContent(payload.planSnapshot) !== canonicalPlanContent(official))
+    return null;
+  return sessionSyncPayloadSchema.parse({
+    ...payload,
+    planVersion: official.version,
+    planSnapshot: official,
+  });
+}
+
+/** Old clients changed only planVersion, leaving snapshot.version=0. Verify the CLAIMED revision, never guess latest. */
+async function repairLegacyBindings(database: Database) {
+  const rows = await database.getAllAsync<SessionRow>(
+    'SELECT * FROM sessions WHERE pending=1 AND conflict_operation_id IS NULL',
+  );
+  for (const row of rows) {
+    const payload = sessionSyncPayloadSchema.parse(JSON.parse(row.payload));
+    if (payload.planVersion < 1 || payload.planVersion === payload.planSnapshot.version) continue;
+    const official = await getPlanRevisionRequest(payload.planId, payload.planVersion).catch(
+      () => null,
+    );
+    if (
+      !official ||
+      official.version !== payload.planVersion ||
+      official.snapshot.version !== payload.planVersion ||
+      canonicalPlanContent(official.snapshot) !== canonicalPlanContent(payload.planSnapshot)
+    ) {
+      await localTransaction(database, async (tx) => {
+        await tx.runAsync(
+          'UPDATE sessions SET dependency_error=? WHERE id=? AND local_revision=?',
+          'A revisão histórica precisa ser conferida antes do envio. O treino continua preservado.',
+          row.id,
+          row.local_revision,
+        );
+      });
+      continue;
+    }
+    await localTransaction(database, async (tx) => {
+      const latest = await tx.getFirstAsync<SessionRow>(
+        'SELECT * FROM sessions WHERE id=?',
+        row.id,
+      );
+      if (!latest || latest.local_revision !== row.local_revision || latest.conflict_operation_id)
+        return;
+      const repaired = sessionSyncPayloadSchema.parse({
+        ...payload,
+        planSnapshot: official.snapshot,
+      });
+      await tx.runAsync(
+        "UPDATE sync_queue SET status='superseded',updated_at=? WHERE entity_type='workout_session' AND entity_id=? AND status IN ('pending','error')",
+        new Date().toISOString(),
+        row.id,
+      );
+      await writeSession(tx, repaired, latest.server_version, true, latest.local_revision, null);
+      await tx.runAsync('UPDATE sessions SET dependency_error=NULL WHERE id=?', row.id);
+      await enqueueSession(tx, repaired, latest.server_version, latest.local_revision);
+    });
+  }
 }
 
 async function adoptSyncedPlans(userId: string, database: Database): Promise<void> {
@@ -967,7 +1042,7 @@ async function adoptSyncedPlans(userId: string, database: Database): Promise<voi
     for (const row of rows) {
       if (row.conflict_operation_id) continue;
       const session = mapSession(row);
-      const ready = await readyPayload(userId, session);
+      const ready = await readyPayload(userId, session, tx);
       if (!ready) continue; // Explicit dirty state retained until its plan dependency can be sent.
       const queued = await tx.getFirstAsync(
         `SELECT id FROM sync_queue WHERE entity_type = 'workout_session' AND entity_id = ? AND local_revision = ? AND status IN ('pending','in_flight','error')`,
@@ -980,6 +1055,7 @@ async function adoptSyncedPlans(userId: string, database: Database): Promise<voi
           JSON.stringify(ready),
           row.id,
         );
+        await tx.runAsync('UPDATE sessions SET dependency_error=NULL WHERE id=?', row.id);
         await enqueueSession(tx, ready, row.server_version, row.local_revision);
       }
     }
@@ -999,6 +1075,7 @@ function mapSession(row: SessionRow): LocalSession {
   return {
     ...payload,
     serverVersion: row.server_version,
+    dependencyError: row.dependency_error ?? null,
     pending: row.pending === 1,
     synced: row.synced === 1,
     conflictOperationId: row.conflict_operation_id,

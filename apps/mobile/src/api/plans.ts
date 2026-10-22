@@ -1,10 +1,12 @@
 import {
   planConflictResultSchema,
   planPageSchema,
+  sessionPlanSnapshotSchema,
   type PlanConflictChoice,
   type PlanSyncPayload,
   type PlanView,
 } from '@meutreino/shared';
+import { z } from 'zod';
 import { apiRequest } from '@/api/client';
 
 async function send<T>(
@@ -30,9 +32,16 @@ export function resolvePlanConflictRequest(
   conflictId: string,
   choice: PlanConflictChoice,
   payload?: PlanSyncPayload,
-): Promise<{ choice: PlanConflictChoice; plan: PlanView; preservedPlan: PlanView | null }> {
+): Promise<ReturnType<typeof planConflictResultSchema.parse>> {
   return send(`/api/v1/workout-plan-conflicts/${conflictId}/resolve`, planConflictResultSchema, {
     method: 'POST',
     body: { choice, payload },
   });
+}
+
+export function getPlanRevisionRequest(planId: string, version: number) {
+  return send(
+    `/api/v1/workout-plans/${planId}/revisions/${version}`,
+    z.object({ version: z.number().int().positive(), snapshot: sessionPlanSnapshotSchema }),
+  );
 }

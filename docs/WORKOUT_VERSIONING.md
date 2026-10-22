@@ -4,13 +4,13 @@ Cada alteração confirmada aumenta `workout_plans.version` e grava uma linha em
 
 A ficha viva é a versão atual. Uma revisão antiga não é reescrita quando o aluno muda séries, ordem, equipamento ou nome. Remover um exercício da ficha atual apenas o desativa (`active = false`). A revisão anterior continua com a configuração daquele momento. Séries executadas, quando existirem, não apontam para a linha viva da série planejada.
 
-## Sessão futura
+## Sessão executada
 
-`workout_sessions.plan_version` é obrigatório quando `workout_plan_id` está preenchido. Não há endpoint de execução nesta etapa. Quando a execução for implementada, o início da sessão deve gravar a versão corrente e ler a revisão correspondente. A tela histórica não pode ler a ficha viva.
+`workout_sessions.plan_version` é obrigatório quando `workout_plan_id` está preenchido. O início online grava a revisão correspondente. O início offline captura uma origem local imutável e espera seu vínculo oficial, conforme [RECOVERY_04_POLICY.md](RECOVERY_04_POLICY.md). A tela histórica não pode ler a ficha viva.
 
 ## Concorrência
 
-Toda mutação REST envia `baseVersion`. Se a versão no servidor for outra, a resposta é 409 `version_mismatch` e nada é gravado.
+Toda mutação REST envia `baseVersion`. No sync, a decisão, o CAS por ID/proprietário/versão, a árvore, a revisão e o recibo estão na mesma transação; uma versão viva encontrada depois não substitui a versão esperada. Se a versão no servidor for outra, a resposta é 409 `version_mismatch` e nada é gravado.
 
 Na fila offline, o mesmo desencontro devolve `conflict` e guarda o payload em `workout_plan_conflicts`, com a mesma chave da operação. Repetir a operação não aplica por cima e não apaga a cópia. A resolução explícita tem três caminhos:
 

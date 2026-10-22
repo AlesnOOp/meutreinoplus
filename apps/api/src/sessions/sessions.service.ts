@@ -18,6 +18,7 @@ import {
   sessionSyncPayloadSchema,
   toCanonicalKilograms,
   canonicalJsonString,
+  canonicalPlanContent,
   type PerformedCorrectionSync,
   type PerformedSetSync,
   type SessionSyncPayload,
@@ -314,7 +315,6 @@ export class SessionsService {
     },
   ) {
     return this.mutate(userId, sessionId, async (tx, session) => {
-      assertOpen(session);
       const exercise = session.exercises.find((item) => item.id === input.exerciseSessionId);
       if (!exercise) {
         throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Exercício não encontrado.');
@@ -346,7 +346,13 @@ export class SessionsService {
           loadUnit: existing.performedLoadUnit,
           notes: existing.notes,
         });
-        if (current !== fingerprint) {
+        if (
+          current !== fingerprint ||
+          existing.plannedSetId !== (input.plannedSetId ?? null) ||
+          (input.setIndex !== undefined && input.setIndex !== existing.setIndex) ||
+          (input.completedAt !== undefined &&
+            new Date(input.completedAt).getTime() !== existing.completedAt.getTime())
+        ) {
           throw fail(
             HttpStatus.CONFLICT,
             'set_immutable',
@@ -355,6 +361,7 @@ export class SessionsService {
         }
         return this.present(tx, sessionId, userId, false);
       }
+      assertOpen(session);
       if (input.outcome === 'completed' && input.repetitions == null && !stored.entered) {
         throw fail(
           HttpStatus.BAD_REQUEST,
@@ -416,7 +423,6 @@ export class SessionsService {
     },
   ) {
     return this.mutate(userId, sessionId, async (tx, session) => {
-      assertOpen(session);
       const set = session.exercises
         .flatMap((exercise) => exercise.sets)
         .find((item) => item.id === setId);
@@ -434,8 +440,23 @@ export class SessionsService {
         invalidSessionReferences();
       const existing = set.corrections.find((correction) => correction.id === correctionId);
       if (existing) {
+        const encoded = encodeLoad(input.load, input.loadUnit);
+        const voided = input.voided === true;
+        if (
+          existing.voided !== voided ||
+          existing.reason !== input.reason ||
+          existing.performedRepetitions !== (voided ? null : (input.repetitions ?? null)) ||
+          decimalString(existing.performedLoad) !== (voided ? null : encoded.entered) ||
+          existing.performedLoadUnit !== (voided ? null : encoded.unit)
+        )
+          throw fail(
+            HttpStatus.CONFLICT,
+            'correction_immutable',
+            'Esta correção já foi registrada com outro conteúdo.',
+          );
         return this.present(tx, sessionId, userId, false);
       }
+      assertOpen(session);
       const stored = encodeLoad(input.load, input.loadUnit);
       const voided = input.voided === true;
       if (!voided && input.repetitions == null && !stored.entered) {
@@ -492,7 +513,6 @@ export class SessionsService {
     input: { perceivedLevel?: number | null; comment?: string | null },
   ) {
     return this.mutate(userId, sessionId, async (tx, session) => {
-      assertOpen(session);
       const exercise = session.exercises.find((item) => item.id === exerciseSessionId);
       if (!exercise) {
         throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Exercício não encontrado.');
@@ -506,6 +526,12 @@ export class SessionsService {
           'Informe um comentário ou uma avaliação.',
         );
       }
+      if (
+        exercise.feedback?.perceivedLevel === perceivedLevel &&
+        exercise.feedback.comment === comment
+      )
+        return this.present(tx, sessionId, userId, false);
+      assertOpen(session);
       await persistFeedback(
         tx,
         userId,
@@ -910,6 +936,7 @@ export class SessionsService {
         'Sincronize a ficha antes de enviar o treino. O treino continua neste aparelho.',
       );
     }
+    const official = sessionPlanSnapshotSchema.parse(revision.snapshot);
     if (payload.gymId) {
       const gym = await tx.gym.findFirst({ where: { id: payload.gymId, ownerUserId: userId } });
       if (!gym) {
@@ -934,8 +961,8 @@ export class SessionsService {
         userId,
         workoutPlanId: plan.id,
         planVersion: payload.planVersion,
-        planNameSnapshot: payload.planSnapshot.name,
-        planSnapshot: jsonValue(payload.planSnapshot),
+        planNameSnapshot: official.name,
+        planSnapshot: jsonValue(official),
         gymId: payload.gymId,
         gymName: payload.gymName,
         status: payload.status,
@@ -956,7 +983,10 @@ export class SessionsService {
           workoutSessionId: payload.id,
           planExerciseId: exercise.planExerciseId,
           exerciseId: exercise.exerciseId,
-          exerciseNameSnapshot: exercise.name.slice(0, 160),
+          exerciseNameSnapshot: (
+            official.exercises.find((row) => row.id === exercise.planExerciseId)?.exerciseName ??
+            exercise.name
+          ).slice(0, 160),
           orderIndex: exercise.orderIndex,
           status: exercise.status,
           skipReason: exercise.status === 'skipped' ? exercise.skipReason || 'Pulado' : null,
@@ -1326,7 +1356,7 @@ export class SessionsService {
         }
         return change(tx, session);
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
     );
   }
 
@@ -1623,7 +1653,11 @@ function reconciliationError(remote: SessionSyncPayload, local: SessionSyncPaylo
     'gymName',
     'startedAt',
   ] as const)
-    if (!sameSessionValue(remote[key], local[key]))
+    if (
+      key === 'planSnapshot'
+        ? canonicalPlanContent(remote[key]) !== canonicalPlanContent(local[key])
+        : !sameSessionValue(remote[key], local[key])
+    )
       return 'A fotografia histórica é imutável. Preserve ambas as versões.';
   if (remote.exerciseSessions.length !== local.exerciseSessions.length)
     return 'A lista de exercícios da execução é imutável.';
@@ -1632,7 +1666,15 @@ function reconciliationError(remote: SessionSyncPayload, local: SessionSyncPaylo
     if (
       !stored ||
       !sameSessionValue(
-        { ...stored, status: exercise.status, skipReason: exercise.skipReason },
+        {
+          ...stored,
+          status: exercise.status,
+          skipReason: exercise.skipReason,
+          name: exercise.name,
+          gymName: exercise.gymName,
+          equipmentName: exercise.equipmentName,
+          machineNumber: exercise.machineNumber,
+        },
         exercise,
       )
     )

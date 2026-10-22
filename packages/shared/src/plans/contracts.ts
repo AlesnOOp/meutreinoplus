@@ -104,6 +104,10 @@ export const planSyncPayloadSchema = planWriteSchema.extend({
   exercises: z.array(planExerciseSchema).max(40).default([]),
 });
 
+export const planSyncMutationSchema = planSyncPayloadSchema.extend({
+  revisionOrigin: z.object({ id: z.uuid(), parentId: z.uuid().nullable() }).optional(),
+});
+
 export const planSchema = planSyncPayloadSchema.extend({
   version: z.number().int().positive(),
   duplicatedFromId: z.uuid().nullable(),
@@ -164,6 +168,9 @@ export const planConflictResultSchema = z.object({
   choice: z.enum(PLAN_CONFLICT_CHOICES),
   plan: planSchema,
   preservedPlan: planSchema.nullable(),
+  revision: z
+    .object({ originId: z.uuid(), version: z.number().int().positive(), snapshot: planSchema })
+    .optional(),
 });
 
 export type PlanView = z.infer<typeof planSchema>;

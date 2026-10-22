@@ -371,6 +371,7 @@ model User {
   authoredPlans       WorkoutPlan[]              @relation("PlanAuthor")
   schedules           WeeklySchedule[]
   workoutSessions     WorkoutSession[]
+  planRevisionOrigins PlanRevisionOrigin[]
   sessionResolutions  WorkoutSessionResolution[]
   feedback            ExerciseFeedback[]
   professionalProfile ProfessionalProfile?
@@ -681,6 +682,7 @@ model WorkoutPlan {
   duplicatedFrom WorkoutPlan?           @relation("PlanDuplication", fields: [duplicatedFromId], references: [id], onDelete: SetNull)
   duplicates     WorkoutPlan[]          @relation("PlanDuplication")
   exercises      WorkoutPlanExercise[]
+  revisionOrigins PlanRevisionOrigin[]
   revisions      WorkoutPlanRevision[]
   conflicts      WorkoutPlanConflict[]
   slots          WeeklyScheduleSlot[]
@@ -765,6 +767,8 @@ model WorkoutPlanRevision {
   @@unique([planId, version])
   @@map("workout_plan_revisions")
   @@schema("meutreino")
+  origin PlanRevisionOrigin?
+
 }
 
 model WorkoutPlanConflict {
@@ -1145,6 +1149,8 @@ model SyncOperation {
   @@index([entityType, entityId])
   @@map("sync_operations")
   @@schema("meutreino")
+  revisionOrigin PlanRevisionOrigin?
+
 }
 
 model AuditLog {
@@ -1277,5 +1283,28 @@ model ExerciseFeedbackRevision {
 
   @@id([feedbackId, version])
   @@map("exercise_feedback_revisions")
+  @@schema("meutreino")
+}
+
+
+model PlanRevisionOrigin {
+  id          String   @id @db.Uuid
+  planId      String   @map("plan_id") @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  version     Int
+  requestHash String   @map("request_hash") @db.VarChar(64)
+  parentId    String?  @map("parent_id") @db.Uuid
+  operationId String   @unique @map("operation_id") @db.Uuid
+  snapshot    Json
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  plan      WorkoutPlan         @relation(fields: [planId], references: [id], onDelete: Restrict)
+  user      User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  operation SyncOperation       @relation(fields: [operationId], references: [id], onDelete: Restrict)
+  revision  WorkoutPlanRevision @relation(fields: [planId, version], references: [planId, version], onDelete: Restrict)
+
+  @@unique([planId, version])
+  @@index([userId])
+  @@map("plan_revision_origins")
   @@schema("meutreino")
 }

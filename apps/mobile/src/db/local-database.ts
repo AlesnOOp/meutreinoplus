@@ -5,7 +5,7 @@ import {
 } from '@meutreino/shared';
 import * as SQLite from 'expo-sqlite';
 
-const SCHEMA_VERSION = '6';
+const SCHEMA_VERSION = '7';
 
 export type LocalDatabaseStatus = {
   ready: true;
@@ -36,6 +36,18 @@ async function initialize(userId: string): Promise<SQLite.SQLiteDatabase> {
   await database.execAsync('PRAGMA journal_mode = WAL;');
   await database.execAsync('PRAGMA foreign_keys = ON;');
   await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS local_plan_revisions (
+      id TEXT PRIMARY KEY NOT NULL, plan_id TEXT NOT NULL, local_revision INTEGER NOT NULL,
+      snapshot TEXT NOT NULL, parent_id TEXT, base_version INTEGER,
+      server_version INTEGER, official_snapshot TEXT, created_at TEXT NOT NULL,
+      UNIQUE(plan_id,local_revision),
+      CHECK(server_version IS NULL OR server_version>0),
+      CHECK((server_version IS NULL) = (official_snapshot IS NULL))
+    );
+    CREATE TRIGGER IF NOT EXISTS local_plan_revision_immutable BEFORE UPDATE OF id,plan_id,local_revision,snapshot,parent_id,base_version ON local_plan_revisions
+      BEGIN SELECT RAISE(ABORT,'local plan revision is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS local_plan_revision_no_delete BEFORE DELETE ON local_plan_revisions
+      BEGIN SELECT RAISE(ABORT,'local plan revision is immutable'); END;
     CREATE TABLE IF NOT EXISTS session_resolution_intents (
       id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL,
@@ -192,7 +204,7 @@ async function migrateSchemaInTransaction(database: SQLite.SQLiteDatabase): Prom
     `ALTER TABLE exercises ADD COLUMN synced INTEGER NOT NULL DEFAULT 0`,
   );
   // Recovery 02: revisions are logical counters, independent of wall-clock time.
-  for (const table of ['gyms', 'equipment', 'exercises', 'sessions']) {
+  for (const table of ['gyms', 'equipment', 'exercises', 'sessions', 'plans']) {
     await ensureColumn(
       database,
       table,
@@ -211,7 +223,11 @@ async function migrateSchemaInTransaction(database: SQLite.SQLiteDatabase): Prom
       'stale_remote_version',
       `ALTER TABLE ${table} ADD COLUMN stale_remote_version INTEGER`,
     );
-    if (Number(version?.value ?? '0') < 5) {
+    if (table === 'plans' && Number(version?.value ?? '0') < 7)
+      await database.runAsync(
+        'UPDATE plans SET local_revision=1,synced=0 WHERE pending=1 AND local_revision=0',
+      );
+    if (Number(version?.value ?? '0') < 5 && table !== 'plans') {
       // Legacy queue entries remain revision 0. Dirty local rows get a newer revision;
       // the sync pass durably enqueues their latest payload before sending old entries.
       await database.runAsync(
@@ -222,6 +238,24 @@ async function migrateSchemaInTransaction(database: SQLite.SQLiteDatabase): Prom
       await database.runAsync(`UPDATE ${table} SET synced = 0 WHERE pending = 1`);
     }
   }
+  await ensureColumn(
+    database,
+    'plans',
+    'origin_revision_id',
+    'ALTER TABLE plans ADD COLUMN origin_revision_id TEXT',
+  );
+  await ensureColumn(
+    database,
+    'sessions',
+    'source_plan_revision_id',
+    'ALTER TABLE sessions ADD COLUMN source_plan_revision_id TEXT',
+  );
+  await ensureColumn(
+    database,
+    'sessions',
+    'dependency_error',
+    'ALTER TABLE sessions ADD COLUMN dependency_error TEXT',
+  );
   await ensureColumn(
     database,
     'sync_queue',

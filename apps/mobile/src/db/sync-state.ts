@@ -1,9 +1,10 @@
 import { Platform } from 'react-native';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
-export type SyncEntity = 'gym' | 'equipment' | 'exercise' | 'workout_session';
+export type SyncEntity = 'gym' | 'equipment' | 'exercise' | 'workout_session' | 'workout_plan';
 const tables = {
   gym: 'gyms',
+  workout_plan: 'plans',
   equipment: 'equipment',
   exercise: 'exercises',
   workout_session: 'sessions',

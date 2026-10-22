@@ -1,6 +1,6 @@
 # Sincronização da sessão
 
-O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 6, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
+O treino inteiro funciona sem rede. Iniciar, registrar série, pausar, descansar e finalizar gravam primeiro no SQLite `meutreino-{userId}.db`, esquema local 7, tabela `sessions`. A fila `sync_queue` recebe uma operação `workout_session` com o agregado inteiro: fotografia, exercícios, séries, correções, feedback e eventos de tempo. A interface só mostra a série como concluída depois dessa gravação.
 
 ## Envio
 
@@ -19,7 +19,7 @@ A resolução exige prévia, revisão local, versão remota esperada, chave idem
 
 ## Sessão nascida offline
 
-O aparelho só enfileira a sessão quando a ficha local já tem versão de servidor maior ou igual a 1 e os exercícios, as séries, as cargas e as repetições ainda coincidem com a fotografia. Se a ficha foi editada depois do início offline, a sessão fica no aparelho. Não sobe com a revisão errada e não é apagada.
+A sessão captura a origem imutável da revisão local usada no início. A fila publica as revisões necessárias em ordem e recebe o vínculo oficial de cada UUID; só então envia a sessão com a fotografia daquela revisão. Editar a ficha depois do início não substitui a prescrição do treino. `planVersion` e `planSnapshot.version` são resolvidos juntos, sem números oficiais inventados no aparelho. Política e tratamento explícito de legados em [RECOVERY_04_POLICY.md](RECOVERY_04_POLICY.md).
 
 Se o servidor não encontra a revisão da `planVersion` declarada, responde `plan_not_synced` e não grava recibo. A fila local volta para `pending`, junto com `session_open`, para tentar de novo. Uma sessão concluída offline, quando a revisão existe, sincroniza sem alterar essa revisão.
 

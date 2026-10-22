@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { HttpStatus, Injectable } from '@nestjs/common';
 import {
   loadExceedsLimit,
+  planSyncMutationSchema,
+  canonicalPlanContent,
   planSyncPayloadSchema,
   toCanonicalKilograms,
   type PlanExerciseInput,
@@ -89,7 +91,7 @@ export class PlansService {
     const plan = await this.prisma.$transaction(async (tx) => {
       const current = await this.ownedTx(tx, userId, planId);
       this.ensureActive(current);
-      await this.bump(tx, planId, baseVersion, {
+      await this.bump(tx, userId, planId, baseVersion, {
         name: input.name,
         description: input.description,
         accent: input.accent ?? null,
@@ -381,6 +383,7 @@ export class PlansService {
     userId: string,
     operation: string,
     payload: PlanSyncPayload,
+    expectedVersion: number | null,
   ): Promise<void> {
     const existing = await tx.workoutPlan.findUnique({ where: { id: payload.id } });
     if (existing && existing.ownerUserId !== userId) {
@@ -388,15 +391,20 @@ export class PlansService {
     }
     if (operation === 'delete' || payload.status === 'archived') {
       if (!existing) {
+        if (operation === 'delete') return;
+        await this.insertPlan(tx, userId, payload, 1);
+        await this.persistTree(tx, userId, payload.id, payload.exercises);
+        await this.revise(tx, payload.id);
         return;
       }
-      await this.bump(tx, payload.id, existing.version, {
+      await this.bump(tx, userId, payload.id, expectedVersion ?? 0, {
         name: payload.name,
         description: payload.description ?? null,
         accent: payload.accent ?? null,
         status: 'archived',
         archivedAt: existing.archivedAt ?? new Date(),
       });
+      await this.persistTree(tx, userId, payload.id, payload.exercises);
       await this.revise(tx, payload.id);
       return;
     }
@@ -406,7 +414,7 @@ export class PlansService {
       await this.revise(tx, payload.id);
       return;
     }
-    await this.bump(tx, payload.id, existing.version, {
+    await this.bump(tx, userId, payload.id, expectedVersion ?? 0, {
       name: payload.name,
       description: payload.description ?? null,
       accent: payload.accent ?? null,
@@ -472,6 +480,19 @@ export class PlansService {
     if (!existing) {
       throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Conflito não encontrado.');
     }
+    const sourceRequest = planSyncMutationSchema.safeParse(existing.payload);
+    if (
+      choice === 'keep_local' &&
+      payload &&
+      sourceRequest.success &&
+      sourceRequest.data.revisionOrigin &&
+      canonicalPlanContent(payload) !== canonicalPlanContent(sourceRequest.data)
+    )
+      throw fail(
+        HttpStatus.CONFLICT,
+        'revision_source_mismatch',
+        'Resolva a revisão original antes das edições posteriores.',
+      );
     if (existing.status !== 'open') {
       if (existing.status !== choice) {
         throw fail(HttpStatus.CONFLICT, 'conflict_resolved', 'Este conflito já foi resolvido.');
@@ -480,7 +501,19 @@ export class PlansService {
       const preserved = existing.preservedPlanId
         ? presentPlan(await this.owned(userId, existing.preservedPlanId))
         : null;
-      return { choice, plan, preservedPlan: preserved };
+      const origin = await this.prisma.planRevisionOrigin.findUnique({
+        where: { operationId: existing.id },
+      });
+      return {
+        choice,
+        plan,
+        preservedPlan: preserved,
+        ...(origin
+          ? {
+              revision: { originId: origin.id, version: origin.version, snapshot: origin.snapshot },
+            }
+          : {}),
+      };
     }
     const stored = planSyncPayloadSchema.safeParse(existing.payload);
     const incoming = payload ?? (stored.success ? stored.data : undefined);
@@ -488,10 +521,17 @@ export class PlansService {
       throw fail(HttpStatus.BAD_REQUEST, 'validation_error', 'A versão local não pôde ser lida.');
     }
     const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM meutreino.workout_plans WHERE id=${existing.planId}::uuid AND owner_user_id=${userId}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM meutreino.workout_plan_conflicts WHERE id=${conflictId}::uuid AND user_id=${userId}::uuid FOR UPDATE`;
+      const claimed = await tx.workoutPlanConflict.findUniqueOrThrow({
+        where: { id: existing.id },
+      });
+      if (claimed.status !== 'open')
+        throw fail(HttpStatus.CONFLICT, 'conflict_resolved', 'Este conflito já foi resolvido.');
       const current = await this.ownedTx(tx, userId, existing.planId);
       let preserved: PlanRecord | null = null;
       if (choice === 'keep_local' && incoming) {
-        await this.bump(tx, current.id, current.version, {
+        await this.bump(tx, userId, current.id, current.version, {
           name: incoming.name,
           description: incoming.description ?? null,
           accent: incoming.accent ?? null,
@@ -500,6 +540,29 @@ export class PlansService {
         });
         await this.persistTree(tx, userId, current.id, incoming.exercises);
         await this.revise(tx, current.id);
+        const source = planSyncMutationSchema.safeParse(existing.payload);
+        if (
+          source.success &&
+          source.data.revisionOrigin &&
+          canonicalPlanContent(source.data) === canonicalPlanContent(incoming)
+        ) {
+          const official = await tx.workoutPlanRevision.findUniqueOrThrow({
+            where: { planId_version: { planId: current.id, version: current.version + 1 } },
+          });
+          const receipt = await tx.syncOperation.findUniqueOrThrow({ where: { id: existing.id } });
+          await tx.planRevisionOrigin.create({
+            data: {
+              id: source.data.revisionOrigin.id,
+              planId: current.id,
+              userId,
+              version: official.version,
+              parentId: source.data.revisionOrigin.parentId,
+              requestHash: receipt.payloadHash,
+              operationId: receipt.id,
+              snapshot: official.snapshot as Prisma.InputJsonValue,
+            },
+          });
+        }
       }
       if (choice === 'keep_both' && incoming) {
         const copy = planSyncPayloadSchema.parse({
@@ -547,7 +610,15 @@ export class PlansService {
       choice,
       plan: presentPlan(result.plan),
       preservedPlan: result.preserved ? presentPlan(result.preserved) : null,
+      ...(await this.originResult(existing.id)),
     };
+  }
+
+  private async originResult(operationId: string) {
+    const origin = await this.prisma.planRevisionOrigin.findUnique({ where: { operationId } });
+    return origin
+      ? { revision: { originId: origin.id, version: origin.version, snapshot: origin.snapshot } }
+      : {};
   }
 
   private async setStatus(
@@ -562,7 +633,7 @@ export class PlansService {
       if (status === 'archived') {
         this.ensureActive(current);
       }
-      await this.bump(tx, planId, baseVersion, {
+      await this.bump(tx, userId, planId, baseVersion, {
         status,
         archivedAt: status === 'archived' ? new Date() : null,
       });
@@ -584,7 +655,7 @@ export class PlansService {
       const current = await this.ownedTx(tx, userId, planId);
       this.ensureActive(current);
       const exercises = change(presentPlan(current));
-      await this.bump(tx, planId, baseVersion, {});
+      await this.bump(tx, userId, planId, baseVersion, {});
       await this.persistTree(tx, userId, planId, exercises);
       await this.revise(tx, planId);
       return this.ownedTx(tx, userId, planId);
@@ -611,12 +682,13 @@ export class PlansService {
 
   private async bump(
     tx: Tx,
+    userId: string,
     planId: string,
     baseVersion: number,
     data: Prisma.WorkoutPlanUpdateManyMutationInput,
   ) {
     const updated = await tx.workoutPlan.updateMany({
-      where: { id: planId, version: baseVersion },
+      where: { id: planId, ownerUserId: userId, version: baseVersion },
       data: { ...data, version: { increment: 1 } },
     });
     if (updated.count !== 1) {

@@ -12,6 +12,7 @@ const APPEND_ONLY_TABLES = [
   'subscription_events',
   'audit_logs',
   'workout_plan_revisions',
+  'plan_revision_origins',
   'session_time_events',
   'workout_session_resolutions',
   'workout_session_variants',
@@ -94,6 +95,7 @@ export class DeletionService {
           await tx.workoutPlanConflict.deleteMany({
             where: { OR: [{ userId }, { planId: { in: planIds } }] },
           });
+          await tx.planRevisionOrigin.deleteMany({ where: { userId } });
           await tx.workoutPlanRevision.deleteMany({ where: { planId: { in: planIds } } });
           await tx.workoutPlan.updateMany({
             where: { ownerUserId: userId },

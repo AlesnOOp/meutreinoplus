@@ -134,10 +134,50 @@ async function harness(
   const sessions = new Map();
   const receipts = new Map();
   const copies = (v) => JSON.parse(JSON.stringify(v));
+  const remotePlans = new Map([[plan.id, copies(plan)]]);
+  const planBindings = new Map();
+  const planResults = new Map();
   const api = {
     pullCatalogSnapshot: async () => copies(remote),
     pushCatalogSync: async (operations) => ({
       results: operations.map((op) => {
+        if (op.entityType === 'workout_plan') {
+          if (planResults.has(op.idempotencyKey))
+            return { ...copies(planResults.get(op.idempotencyKey)), id: op.id };
+          const payload = shared.planSyncMutationSchema.parse(op.payload);
+          const old = remotePlans.get(op.entityId);
+          const expected = payload.revisionOrigin?.parentId
+            ? planBindings.get(payload.revisionOrigin.parentId)?.version
+            : op.baseVersion;
+          if (old && expected !== old.version)
+            return { id: op.id, status: 'conflict', code: 'version_mismatch' };
+          const official = {
+            ...shared.planSyncPayloadSchema.parse(payload),
+            version: (old?.version ?? 0) + 1,
+            duplicatedFromId: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+          };
+          remotePlans.set(op.entityId, official);
+          const result = {
+            id: op.id,
+            status: 'applied',
+            ...(payload.revisionOrigin
+              ? {
+                  revision: {
+                    originId: payload.revisionOrigin.id,
+                    version: official.version,
+                    snapshot: official,
+                  },
+                }
+              : {}),
+          };
+          if (result.revision) planBindings.set(result.revision.originId, result.revision);
+          planResults.set(op.idempotencyKey, result);
+          receipts.set(op.idempotencyKey, true);
+          return copies(result);
+        }
         if (!receipts.has(op.idempotencyKey)) {
           const table =
             op.entityType === 'gym'
@@ -165,7 +205,17 @@ async function harness(
         return { id: op.id, status: 'applied' };
       }),
     }),
-    listPlansRequest: async () => ({ items: [copies(plan)], total: 1 }),
+    getPlanRevisionRequest: async (id, version) => ({
+      version,
+      snapshot: copies(
+        [...planBindings.values()].find((row) => row.snapshot.id === id && row.version === version)
+          ?.snapshot ?? remotePlans.get(id),
+      ),
+    }),
+    listPlansRequest: async () => ({
+      items: copies([...remotePlans.values()]),
+      total: remotePlans.size,
+    }),
     startSessionRequest: async (body) => ({ payload: sessions.get(body.id), version: 1 }),
     pushSessionSync: async (operations) => ({
       results: operations.map((op) => {
@@ -316,6 +366,8 @@ async function harness(
     api,
     sessions,
     receipts,
+    remotePlans,
+    planBindings,
     directory,
     get db() {
       return db;

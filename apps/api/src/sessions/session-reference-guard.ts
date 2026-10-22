@@ -1,5 +1,10 @@
 import { HttpStatus } from '@nestjs/common';
-import { sessionPlanSnapshotSchema, type SessionSyncPayload } from '@meutreino/shared';
+import {
+  normalizeLoad,
+  canonicalPlanContent,
+  sessionPlanSnapshotSchema,
+  type SessionSyncPayload,
+} from '@meutreino/shared';
 import type { Prisma } from '../generated/prisma/client';
 import { fail } from '../identity/http';
 
@@ -69,6 +74,7 @@ export async function validateSessionReferences(
   ) {
     invalidSessionReferences();
   }
+  const official = sessionPlanSnapshotSchema.parse(revision.snapshot);
   const planned = new Map(canonical.data.exercises.map((exercise) => [exercise.id, exercise]));
   uniqueIds(payload.planSnapshot.exercises);
   for (const exercise of payload.planSnapshot.exercises) {
@@ -102,6 +108,21 @@ export async function validateSessionReferences(
     new Set(payload.feedback.map((item) => item.exerciseSessionId)).size !== payload.feedback.length
   )
     invalidSessionReferences();
+  if (
+    payload.exerciseSessions.length !== official.exercises.length ||
+    new Set(payload.exerciseSessions.map((row) => row.planExerciseId)).size !==
+      official.exercises.length
+  )
+    invalidSessionReferences();
+  for (const exercise of payload.exerciseSessions) {
+    const prescribed = official.exercises.find((row) => row.id === exercise.planExerciseId);
+    if (
+      !prescribed ||
+      prescribed.orderIndex !== exercise.orderIndex ||
+      prescribed.restSeconds !== exercise.restSeconds
+    )
+      invalidSessionReferences();
+  }
   const exercises = new Map(existing?.exercises.map((exercise) => [exercise.id, exercise]) ?? []);
   const storedExercises = await tx.exerciseSession.findMany({
     where: { id: { in: payload.exerciseSessions.map((exercise) => exercise.id) } },
@@ -174,6 +195,24 @@ export async function validateSessionReferences(
       invalidSessionReferences();
     }
   }
+  for (const set of payload.performedSets) {
+    if (!set.plannedSetId) continue;
+    const exercise = exercises.get(set.exerciseSessionId);
+    const prescribed = official.exercises
+      .find((row) => row.id === exercise?.planExerciseId)
+      ?.sets.find((row) => row.id === set.plannedSetId);
+    if (
+      !prescribed ||
+      set.plannedRepetitions !== prescribed.repetitions ||
+      (set.plannedLoad ? normalizeLoad(set.plannedLoad) : null) !== prescribed.load ||
+      (prescribed.load && set.plannedLoadUnit !== prescribed.loadUnit)
+    )
+      throw fail(
+        HttpStatus.BAD_REQUEST,
+        'invalid_plan_snapshot',
+        'Os valores planejados não correspondem à revisão oficial.',
+      );
+  }
   const allowedSetIds = new Set([...sets.keys(), ...payload.performedSets.map((set) => set.id)]);
   const storedCorrections = await tx.performedSetCorrection.findMany({
     where: { id: { in: payload.corrections.map((correction) => correction.id) } },
@@ -220,5 +259,15 @@ export async function validateSessionReferences(
     ) {
       invalidSessionReferences();
     }
+  }
+  if (
+    canonicalPlanContent(payload.planSnapshot) !== canonicalPlanContent(official) ||
+    (existing && canonicalPlanContent(existing.planSnapshot) !== canonicalPlanContent(official))
+  ) {
+    throw fail(
+      HttpStatus.BAD_REQUEST,
+      'invalid_plan_snapshot',
+      'A fotografia do treino não corresponde à revisão oficial da ficha.',
+    );
   }
 }

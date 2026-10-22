@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { planSchema } from '../plans/contracts';
 import { ACTIVITY_TYPES, EQUIPMENT_TYPES, MUSCLE_GROUPS } from '../domain/catalog';
 
 export const ARCHIVE_STATUSES = ['active', 'archived'] as const;
@@ -120,6 +121,9 @@ export const syncPushResultSchema = z.object({
       id: z.uuid(),
       status: z.enum(['applied', 'rejected', 'conflict']),
       code: z.string().optional(),
+      revision: z
+        .object({ originId: z.uuid(), version: z.number().int().positive(), snapshot: planSchema })
+        .optional(),
     }),
   ),
 });

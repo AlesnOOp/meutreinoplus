@@ -6,9 +6,10 @@ import {
   evaluateSyncDecision,
   exerciseSyncPayloadSchema,
   gymSyncPayloadSchema,
-  planSyncPayloadSchema,
+  planSyncMutationSchema,
   type SyncOperationEnvelope,
 } from '@meutreino/shared';
+import { Prisma } from '../generated/prisma/client';
 import { sha256 } from '../identity/crypto';
 import { fail } from '../identity/http';
 import { PlansService } from '../plans/plans.service';
@@ -65,6 +66,7 @@ export class SyncApplyService {
         'A operação não confere com o conteúdo enviado.',
       );
     }
+    if (parsed.kind === 'plan') return this.applyPlan(userId, deviceId, operation, parsed.value);
     const existingOperation = await this.prisma.syncOperation.findUnique({
       where: { idempotencyKey: operation.idempotencyKey },
     });
@@ -105,19 +107,6 @@ export class SyncApplyService {
     });
     if (decision.outcome === 'reject' || decision.outcome === 'conflict') {
       const status = decision.outcome === 'conflict' ? 'conflict' : 'rejected';
-      if (
-        status === 'conflict' &&
-        operation.entityType === 'workout_plan' &&
-        parsed.kind === 'plan'
-      ) {
-        await this.plans.preserveConflict(
-          userId,
-          operation.id,
-          operation.entityId,
-          operation.baseVersion,
-          parsed.value,
-        );
-      }
       await this.receipt(userId, deviceId, operation, status, decision.code);
       return { id: operation.id, status, code: decision.code };
     }
@@ -142,6 +131,165 @@ export class SyncApplyService {
       });
     });
     return { id: operation.id, status: 'applied' as const };
+  }
+
+  private async applyPlan(
+    userId: string,
+    deviceId: string,
+    operation: PushOperation,
+    payload: ReturnType<typeof planSyncMutationSchema.parse>,
+  ) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.prisma.$transaction(
+          async (tx) => {
+            // Also serialize creation and retries when no row exists yet.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan-key:${operation.idempotencyKey}`},0))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`plan:${payload.id}`},0))`;
+            const current = await tx.workoutPlan.findUnique({ where: { id: payload.id } });
+            if (current && current.ownerUserId !== userId)
+              throw fail(HttpStatus.NOT_FOUND, 'not_found', 'Ficha não encontrada.');
+            const receipt = await tx.syncOperation.findUnique({
+              where: { idempotencyKey: operation.idempotencyKey },
+            });
+            if (receipt) {
+              if (
+                receipt.userId !== userId ||
+                receipt.entityType !== 'workout_plan' ||
+                receipt.entityId !== payload.id ||
+                receipt.operation !== operation.operation ||
+                receipt.payloadHash !== operation.payloadHash ||
+                receipt.baseVersion !== operation.baseVersion
+              )
+                return {
+                  id: operation.id,
+                  status: 'rejected' as const,
+                  code: 'idempotency_key_reused',
+                };
+              const origin = await tx.planRevisionOrigin.findUnique({
+                where: { operationId: receipt.id },
+              });
+              return {
+                id: operation.id,
+                status: receipt.status as 'applied' | 'conflict' | 'rejected',
+                ...(receipt.conflictCode ? { code: receipt.conflictCode } : {}),
+                ...(origin
+                  ? {
+                      revision: {
+                        originId: origin.id,
+                        version: origin.version,
+                        snapshot: origin.snapshot,
+                      },
+                    }
+                  : {}),
+              };
+            }
+            if (await tx.syncOperation.findUnique({ where: { id: operation.id } }))
+              return {
+                id: operation.id,
+                status: 'rejected' as const,
+                code: 'idempotency_key_reused',
+              };
+            let expected = operation.baseVersion;
+            if (payload.revisionOrigin) {
+              const known = await tx.planRevisionOrigin.findUnique({
+                where: { id: payload.revisionOrigin.id },
+              });
+              if (known)
+                return {
+                  id: operation.id,
+                  status: 'rejected' as const,
+                  code: 'revision_origin_reused',
+                };
+              if (payload.revisionOrigin.parentId) {
+                const parent = await tx.planRevisionOrigin.findUnique({
+                  where: { id: payload.revisionOrigin.parentId },
+                });
+                if (!parent || parent.userId !== userId || parent.planId !== payload.id)
+                  return {
+                    id: operation.id,
+                    status: 'rejected' as const,
+                    code: 'plan_dependency_missing',
+                  };
+                expected = parent.version;
+              }
+            }
+            const conflict = current ? expected !== current.version : expected !== null;
+            const status = conflict ? 'conflict' : 'applied';
+            if (conflict && current)
+              await tx.workoutPlanConflict.create({
+                data: {
+                  id: operation.id,
+                  userId,
+                  planId: payload.id,
+                  baseVersion: expected,
+                  payload: JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue,
+                  status: 'open',
+                },
+              });
+            if (!conflict)
+              await this.plans.applySynced(tx, userId, operation.operation, payload, expected);
+            await tx.syncOperation.create({
+              data: {
+                id: operation.id,
+                userId,
+                deviceId,
+                entityType: 'workout_plan',
+                entityId: payload.id,
+                operation: operation.operation,
+                idempotencyKey: operation.idempotencyKey,
+                payloadHash: operation.payloadHash,
+                baseVersion: operation.baseVersion,
+                status: conflict ? 'conflict' : 'applied',
+                conflictCode: conflict ? 'version_mismatch' : null,
+                appliedAt: conflict ? null : new Date(),
+              },
+            });
+            if (!conflict && payload.revisionOrigin) {
+              const version = (current?.version ?? 0) + 1;
+              const revision = await tx.workoutPlanRevision.findUniqueOrThrow({
+                where: { planId_version: { planId: payload.id, version } },
+              });
+              await tx.planRevisionOrigin.create({
+                data: {
+                  id: payload.revisionOrigin.id,
+                  userId,
+                  planId: payload.id,
+                  version,
+                  parentId: payload.revisionOrigin.parentId,
+                  requestHash: operation.payloadHash,
+                  operationId: operation.id,
+                  snapshot: revision.snapshot as Prisma.InputJsonValue,
+                },
+              });
+              return {
+                id: operation.id,
+                status: 'applied' as const,
+                revision: {
+                  originId: payload.revisionOrigin.id,
+                  version,
+                  snapshot: revision.snapshot,
+                },
+              };
+            }
+            return {
+              id: operation.id,
+              status: status as 'applied' | 'conflict',
+              ...(conflict ? { code: 'version_mismatch' } : {}),
+            };
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeout: 15000 },
+        );
+      } catch (error) {
+        if (
+          attempt < 3 &&
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          ['P2034', 'P2002'].includes(error.code)
+        )
+          continue;
+        throw error;
+      }
+    }
   }
 
   private async currentRecord(userId: string, entityType: string, entityId: string) {
@@ -207,7 +355,13 @@ export class SyncApplyService {
       return;
     }
     if (operation.entityType === 'workout_plan' && payload.kind === 'plan') {
-      await this.plans.applySynced(tx, userId, operation.operation, payload.value);
+      await this.plans.applySynced(
+        tx,
+        userId,
+        operation.operation,
+        payload.value,
+        operation.baseVersion,
+      );
       return;
     }
     throw fail(HttpStatus.BAD_REQUEST, 'unsupported_entity', 'Esta entidade ainda não sincroniza.');
@@ -256,7 +410,7 @@ function parsePayload(operation: PushOperation) {
     return { kind: 'exercise' as const, value: readPayload(exerciseSyncPayloadSchema, operation) };
   }
   if (operation.entityType === 'workout_plan') {
-    return { kind: 'plan' as const, value: readPayload(planSyncPayloadSchema, operation) };
+    return { kind: 'plan' as const, value: readPayload(planSyncMutationSchema, operation) };
   }
   throw fail(HttpStatus.BAD_REQUEST, 'unsupported_entity', 'Esta entidade ainda não sincroniza.');
 }
